@@ -1,0 +1,22 @@
+# Runtime invoice data
+/invoices/
+/used_invoices/
+/failed_invoices/
+/void_invoices/
+/data/
+/print_jobs/
+
+# Build outputs and caches
+/build/
+/dist/
+/__pycache__/
+*.py[cod]
+*.pyo
+*.spec
+*.exe
+*.zip
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+desktop.ini
