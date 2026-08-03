@@ -64,7 +64,7 @@ LEGACY_RUNTIME_FILES = (
     (APP_DIR / "app_settings.json", SETTINGS_FILE),
     (APP_DIR / "invoice_records.sqlite3", DATABASE_FILE),
 )
-APP_VERSION = "v1.0728.0914"
+APP_VERSION = "v1.0728.1059"
 
 CATEGORY_ALL = "全部"
 CATEGORIES = [CATEGORY_ALL, "交通", "餐饮", "住宿", "办公", "其他"]
@@ -1782,31 +1782,38 @@ class AutoInvoiceApp(tk.Tk):
         right = ttk.Frame(main)
         main.add(left, weight=3)
         main.add(right, weight=2)
+        left.rowconfigure(0, weight=1, uniform="invoice_lists")
+        left.rowconfigure(1, weight=1, uniform="invoice_lists")
+        left.columnconfigure(0, weight=1)
 
         invoice_panel = ttk.Frame(left, style="Panel.TFrame", padding=10)
-        invoice_panel.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        invoice_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+        invoice_panel.rowconfigure(1, weight=1)
+        invoice_panel.columnconfigure(0, weight=1)
         invoice_header = ttk.Frame(invoice_panel, style="Panel.TFrame")
-        invoice_header.pack(fill=tk.X)
+        invoice_header.grid(row=0, column=0, sticky="ew")
         ttk.Label(invoice_header, text="可用发票", style="Summary.TLabel").pack(side=tk.LEFT)
         ttk.Label(invoice_header, textvariable=self.available_summary_var, style="Summary.TLabel").pack(side=tk.RIGHT)
-        self.invoice_tree = self.create_tree(invoice_panel)
-        self.invoice_tree.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self.invoice_tree = self.create_tree(invoice_panel, show_status=True)
+        self.invoice_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
         self.invoice_tree.bind("<<TreeviewSelect>>", lambda _event: self.preview_from_tree(self.invoice_tree, self.invoices))
         self.invoice_tree.bind("<Double-1>", self.add_available_invoice_to_result)
 
         result_panel = ttk.Frame(left, style="Panel.TFrame", padding=10)
-        result_panel.pack(fill=tk.BOTH, expand=True)
+        result_panel.grid(row=1, column=0, sticky="nsew")
+        result_panel.rowconfigure(1, weight=1)
+        result_panel.columnconfigure(0, weight=1)
         result_header = ttk.Frame(result_panel, style="Panel.TFrame")
-        result_header.pack(fill=tk.X)
+        result_header.grid(row=0, column=0, sticky="ew")
         ttk.Label(result_header, text="推荐组合", style="Summary.TLabel").pack(side=tk.LEFT)
         ttk.Label(result_header, textvariable=self.summary_var, style="Summary.TLabel").pack(side=tk.RIGHT)
         self.result_tree = self.create_tree(result_panel, selectmode="extended")
-        self.result_tree.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+        self.result_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
         self.result_tree.bind("<<TreeviewSelect>>", lambda _event: self.preview_from_tree(self.result_tree, self.result_invoices))
         self.result_tree.bind("<Double-1>", self.remove_result_invoice_from_result)
 
         result_actions = ttk.Frame(result_panel, style="Panel.TFrame")
-        result_actions.pack(fill=tk.X)
+        result_actions.grid(row=2, column=0, sticky="ew")
         ttk.Button(result_actions, text="标记已使用并移动", command=self.mark_selected_used).pack(side=tk.LEFT)
         ttk.Button(result_actions, text="全部标记使用并移动", command=self.mark_all_used).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(result_actions, text="清空组合", command=self.clear_result).pack(side=tk.LEFT, padx=(8, 0))
@@ -1829,22 +1836,23 @@ class AutoInvoiceApp(tk.Tk):
         self.preview_canvas.pack(fill=tk.BOTH, expand=True)
         self.preview_canvas.bind("<Configure>", lambda _event: self.render_preview())
 
-    def create_tree(self, parent, selectmode: str = "browse") -> ttk.Treeview:
-        columns = ("amount", "type", "date", "number", "file")
+    def create_tree(self, parent, selectmode: str = "browse", show_status: bool = False) -> ttk.Treeview:
+        columns = ("status", "amount", "type", "date", "number") if show_status else ("amount", "type", "date", "number")
         tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode=selectmode)
+        if show_status:
+            tree.heading("status", text="状态")
+            tree.column("status", width=48, anchor=tk.CENTER, stretch=False)
         tree.heading("amount", text="金额")
         tree.heading("type", text="类型")
         tree.heading("date", text="日期")
         tree.heading("number", text="号码")
-        tree.heading("file", text="文件")
         tree.column("amount", width=80, anchor=tk.E)
         tree.column("type", width=70, anchor=tk.CENTER)
         tree.column("date", width=110, anchor=tk.CENTER)
-        tree.column("number", width=160, anchor=tk.W)
-        tree.column("file", width=360, anchor=tk.W)
+        tree.column("number", width=190, anchor=tk.W)
         scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar.grid(row=1, column=1, sticky="ns", pady=(8, 0))
         return tree
 
     def set_status(self, message: str) -> None:
@@ -1876,23 +1884,28 @@ class AutoInvoiceApp(tk.Tk):
 
     def populate_tree(self, tree: ttk.Treeview, invoices: list[Invoice]) -> None:
         tree.delete(*tree.get_children())
+        show_status = "status" in tree["columns"]
+        result_paths = {invoice.path for invoice in self.result_invoices} if show_status else set()
         for index, invoice in enumerate(invoices):
+            values = [
+                invoice.amount_text,
+                invoice.invoice_type,
+                invoice.invoice_date,
+                invoice.invoice_number,
+            ]
+            if show_status:
+                values.insert(0, "✅" if invoice.path in result_paths else "")
             tree.insert(
                 "",
                 tk.END,
                 iid=str(index),
-                values=(
-                    invoice.amount_text,
-                    invoice.invoice_type,
-                    invoice.invoice_date,
-                    invoice.invoice_number,
-                    invoice.filename,
-                ),
+                values=values,
             )
 
     def refresh_result_tree(self) -> None:
         self.reset_print_preview()
         self.populate_tree(self.result_tree, self.result_invoices)
+        self.populate_tree(self.invoice_tree, self.invoices)
         self.update_result_summary()
 
     def add_available_invoice_to_result(self, _event=None) -> None:
@@ -1961,6 +1974,7 @@ class AutoInvoiceApp(tk.Tk):
     def calculate(self) -> None:
         if self.calculation_running:
             return
+        self.clear_result()
         target = self.target_cents()
         if target is None:
             return
@@ -1994,6 +2008,7 @@ class AutoInvoiceApp(tk.Tk):
         self.result_invoices = result
         self.reset_print_preview()
         self.populate_tree(self.result_tree, self.result_invoices)
+        self.populate_tree(self.invoice_tree, self.invoices)
         if not result:
             self.summary_var.set("没有找到可覆盖金额的组合")
             self.set_status("没有找到可覆盖金额的组合")
@@ -2008,8 +2023,13 @@ class AutoInvoiceApp(tk.Tk):
 
     def clear_result(self) -> None:
         self.result_invoices = []
+        self.preview_invoice = None
+        self.preview_page = 0
+        self.preview_photo = None
         self.reset_print_preview()
         self.populate_tree(self.result_tree, self.result_invoices)
+        self.populate_tree(self.invoice_tree, self.invoices)
+        self.render_preview()
         self.summary_var.set("未计算")
 
     def reset_print_preview(self) -> None:
