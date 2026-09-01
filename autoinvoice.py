@@ -64,7 +64,7 @@ LEGACY_RUNTIME_FILES = (
     (APP_DIR / "app_settings.json", SETTINGS_FILE),
     (APP_DIR / "invoice_records.sqlite3", DATABASE_FILE),
 )
-APP_VERSION = "v1.0728.1059"
+APP_VERSION = "v1.0901.1626"
 
 CATEGORY_ALL = "全部"
 CATEGORIES = [CATEGORY_ALL, "交通", "餐饮", "住宿", "办公", "其他"]
@@ -774,6 +774,117 @@ def append_json_record(file_path: Path, record: dict) -> None:
 
 def normalize_invoice_number_value(value: object) -> str:
     return str(value or "").strip()
+
+
+def safe_filename_component(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value.strip())
+    cleaned = cleaned.strip(" .")
+    if not cleaned:
+        return ""
+    reserved_names = {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+    if cleaned.upper() in reserved_names:
+        cleaned = f"{cleaned}_"
+    return cleaned
+
+
+def unique_planned_filename(directory: Path, desired_name: str, allocated_names: set[str], reserved_names: set[str]) -> str:
+    desired_path = directory / desired_name
+    stem = desired_path.stem
+    suffix = desired_path.suffix
+    for index in range(0, 1000):
+        filename = desired_name if index == 0 else f"{stem}_{index}{suffix}"
+        key = filename.lower()
+        if key not in allocated_names and key not in reserved_names:
+            allocated_names.add(key)
+            return filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{stem}_{timestamp}{suffix}"
+    allocated_names.add(filename.lower())
+    return filename
+
+
+def unique_rename_temp_path(source: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    for index in range(0, 1000):
+        candidate = source.with_name(f".autoinvoice_rename_{timestamp}_{index}_{source.name}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"无法创建临时重命名文件名：{source.name}")
+
+
+def rename_invoice_files_by_number() -> tuple[int, int, list[str]]:
+    ensure_dirs()
+    invoice_paths = sorted(
+        (
+            path
+            for path in INVOICE_DIR.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_INVOICE_SUFFIXES
+        ),
+        key=invoice_file_sort_key,
+    )
+    entries: list[tuple[Path, str]] = []
+    skipped: list[str] = []
+    for path in invoice_paths:
+        try:
+            invoice = parse_invoice(path)
+            invoice_number = normalize_invoice_number_value(invoice.invoice_number)
+            if not invoice_number:
+                skipped.append(f"{path.name}: 未识别到发票号码")
+                continue
+            filename_stem = safe_filename_component(invoice_number)
+            if not filename_stem:
+                skipped.append(f"{path.name}: 发票号码不能作为文件名")
+                continue
+            entries.append((path, f"{filename_stem}{path.suffix.lower()}"))
+        except Exception as exc:
+            skipped.append(f"{path.name}: {exc}")
+
+    source_names = {path.name.lower() for path, _desired_name in entries}
+    reserved_names = {
+        path.name.lower()
+        for path in INVOICE_DIR.iterdir()
+        if path.is_file() and path.name.lower() not in source_names
+    }
+    allocated_names: set[str] = set()
+    rename_plan: list[tuple[Path, Path]] = []
+    unchanged = 0
+    for path, desired_name in entries:
+        if path.name.lower() == desired_name.lower():
+            allocated_names.add(path.name.lower())
+            unchanged += 1
+            continue
+        final_name = unique_planned_filename(INVOICE_DIR, desired_name, allocated_names, reserved_names)
+        rename_plan.append((path, INVOICE_DIR / final_name))
+
+    temp_plan: list[tuple[Path, Path, Path]] = []
+    try:
+        for source, target in rename_plan:
+            temp_path = unique_rename_temp_path(source)
+            source.rename(temp_path)
+            temp_plan.append((temp_path, source, target))
+    except Exception:
+        for temp_path, original_path, _target in reversed(temp_plan):
+            if temp_path.exists() and not original_path.exists():
+                try:
+                    temp_path.rename(original_path)
+                except Exception:
+                    pass
+        raise
+
+    try:
+        for temp_path, _original_path, target in temp_plan:
+            temp_path.rename(target)
+    except Exception as exc:
+        raise RuntimeError(f"重命名过程中断，请检查 invoices 目录中的临时文件：{exc}") from exc
+
+    return len(rename_plan), unchanged, skipped
 
 
 def int_or_zero(value: object) -> int:
@@ -1774,6 +1885,7 @@ class AutoInvoiceApp(tk.Tk):
         self.calculate_button.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(controls, text="扫描发票", command=self.scan).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(controls, text="发票目录", command=lambda: os.startfile(INVOICE_DIR)).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(controls, text="自动文件名", command=self.rename_files_by_invoice_number).pack(side=tk.LEFT, padx=(0, 8))
 
         main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 10))
@@ -1877,6 +1989,26 @@ class AutoInvoiceApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("扫描失败", f"{exc}\n\n{traceback.format_exc()}")
             self.set_status("扫描失败")
+
+    def rename_files_by_invoice_number(self) -> None:
+        try:
+            self.set_status("正在按发票号码重命名...")
+            renamed, unchanged, skipped = rename_invoice_files_by_number()
+            self.scan()
+            message = f"已重命名 {renamed} 个文件，{unchanged} 个文件名无需修改"
+            if skipped:
+                message += f"，{len(skipped)} 个文件跳过"
+            self.set_status(message)
+            if skipped:
+                details = "\n".join(skipped[:20])
+                if len(skipped) > 20:
+                    details += f"\n... 还有 {len(skipped) - 20} 个文件"
+                messagebox.showwarning("自动文件名完成", f"{message}\n\n{details}")
+            else:
+                messagebox.showinfo("自动文件名完成", message)
+        except Exception as exc:
+            messagebox.showerror("自动文件名失败", f"{exc}\n\n{traceback.format_exc()}")
+            self.set_status("自动文件名失败")
 
     def update_available_summary(self) -> None:
         total = sum(invoice.amount_cents for invoice in self.invoices)
