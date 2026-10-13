@@ -14,18 +14,20 @@ import unicodedata
 import ctypes
 import hashlib
 import zipfile
+from contextlib import closing
 from ctypes import wintypes
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 import xml.etree.ElementTree as ET
 
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from pypdf import PdfReader, PdfWriter
+import xlsxwriter
 
 try:
     import fitz  # PyMuPDF
@@ -33,9 +35,9 @@ except Exception:  # pragma: no cover - dependency check is shown in the UI
     fitz = None
 
 try:
-    from PIL import Image, ImageTk, ImageWin
+    from PIL import Image, ImageOps, ImageTk, ImageWin
 except Exception:  # pragma: no cover - dependency check is shown in the UI
-    Image = ImageTk = ImageWin = None
+    Image = ImageOps = ImageTk = ImageWin = None
 
 try:
     import win32con
@@ -64,7 +66,7 @@ LEGACY_RUNTIME_FILES = (
     (APP_DIR / "app_settings.json", SETTINGS_FILE),
     (APP_DIR / "invoice_records.sqlite3", DATABASE_FILE),
 )
-APP_VERSION = "v1.0901.1626"
+APP_VERSION = "v1.1013.1323"
 
 CATEGORY_ALL = "全部"
 CATEGORIES = [CATEGORY_ALL, "交通", "餐饮", "住宿", "办公", "其他"]
@@ -73,10 +75,15 @@ DATE_PRIORITY_WINDOW_CENTS = 5000
 SMALL_INVOICE_THRESHOLD_CENTS = 5000
 SMALL_INVOICE_MAX_COUNT = 2
 DATABASE_INITIALIZED = False
-SUPPORTED_INVOICE_SUFFIXES = {".pdf", ".ofd"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+SUPPORTED_INVOICE_SUFFIXES = {".pdf", ".ofd"} | IMAGE_SUFFIXES
 PDF_SUFFIX = ".pdf"
 OFD_SUFFIX = ".ofd"
 OFD_RENDER_VERSION = "ofd-render-v3"
+IMAGE_RENDER_VERSION = "image-render-v1"
+OCR_CACHE_VERSION = "rapidocr-3.10-v1"
+OCR_ENGINE = None
+OCR_LOCK = threading.Lock()
 PT_PER_MM = 72 / 25.4
 CHINESE_FONT_CANDIDATES = (
     Path(r"C:\Windows\Fonts\msyh.ttc"),
@@ -245,6 +252,117 @@ def read_pdf_text_with_fitz(path: Path) -> tuple[str, int]:
     with fitz.open(path) as doc:
         text = "\n".join(page.get_text("text") for page in doc)
         return normalize_text(text), len(doc)
+
+
+def get_ocr_engine():
+    global OCR_ENGINE
+    if OCR_ENGINE is None:
+        try:
+            from rapidocr import RapidOCR
+            OCR_ENGINE = RapidOCR(params={
+                "Global.log_level": "error",
+                "EngineConfig.onnxruntime.intra_op_num_threads": 2,
+                "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+            })
+        except Exception as exc:
+            raise RuntimeError(f"图片 OCR 初始化失败：{exc}") from exc
+    return OCR_ENGINE
+
+
+def image_rgb_frame(source):
+    frame = ImageOps.exif_transpose(source.copy())
+    if frame.mode in ("RGBA", "LA") or "transparency" in frame.info:
+        rgba = frame.convert("RGBA")
+        background = Image.new("RGB", rgba.size, "white")
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        return background
+    return frame.convert("RGB")
+
+
+def ocr_output_text(result) -> str:
+    if result.txts is None or result.boxes is None:
+        return ""
+    entries = []
+    for box, text in zip(result.boxes, result.txts):
+        xs = [float(point[0]) for point in box]
+        ys = [float(point[1]) for point in box]
+        entries.append(((min(ys) + max(ys)) / 2, min(xs), max(max(ys) - min(ys), 1), text))
+    rows = []
+    # Join nearby OCR boxes into rows so labels stay next to their values.
+    for center, left, height, text in sorted(entries):
+        if rows and abs(center - rows[-1][0]) <= min(height, rows[-1][1]) * 0.5:
+            rows[-1][2].append((left, text))
+        else:
+            rows.append((center, height, [(left, text)]))
+    return normalize_text("\n".join(" ".join(text for _, text in sorted(items)) for _, _, items in rows))
+
+
+def read_image_text(path: Path) -> tuple[str, int]:
+    if Image is None:
+        raise RuntimeError("缺少 Pillow，无法读取图片发票")
+    with path.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    cache_dir = DATA_DIR / "ocr_cache"
+    cache_path = cache_dir / f"{OCR_CACHE_VERSION}_{digest}.json"
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(cached.get("text"), str) and isinstance(cached.get("pages"), int) and cached["pages"] > 0:
+            return cached["text"], cached["pages"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    parts = []
+    with Image.open(path) as source:
+        pages = getattr(source, "n_frames", 1)
+        for page in range(pages):
+            source.seek(page)
+            frame = image_rgb_frame(source)
+            with OCR_LOCK:
+                result = get_ocr_engine()(frame)
+            parts.append(ocr_output_text(result))
+    text = "\n".join(parts)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(f".{threading.get_ident()}.tmp")
+        temporary.write_text(json.dumps({"text": text, "pages": pages}, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(cache_path)
+    except OSError:
+        pass
+    return text, pages
+
+
+def extract_image_amount_cents(text: str) -> int | None:
+    text = normalize_text(text)
+    text = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", text)
+    # OCR may lose the currency symbol. Only allow that fallback beside a total label.
+    for label in (r"小\s*写", r"价\s*税\s*合\s*计", r"(?:实收金额|金额合计|总金额)"):
+        match = re.search(label + r"[)）:：\s]*[¥Y]?\s*([0-9][0-9, ]*\.[0-9]{2})(?![0-9])", text)
+        if match:
+            return parse_money_to_cents(match.group(1).replace(" ", ""))
+        if re.search(label, text):
+            return None
+    values = [parse_money_to_cents(value.replace(" ", "")) for value in re.findall(r"¥\s*([0-9][0-9, ]*\.[0-9]{2})(?![0-9])", text)]
+    return max((value for value in values if value is not None), default=None)
+
+
+def parse_image_invoice(path: Path) -> Invoice:
+    text, pages = read_image_text(path)
+    amount_cents = extract_image_amount_cents(text)
+    if amount_cents is None:
+        raise ValueError("图片 OCR 未识别到发票金额，请检查图片清晰度及价税合计区域")
+    number_match = re.search(r"发\s*票\s*号\s*码[:：\s]*([0-9][0-9 ]{7,40})", text)
+    invoice_number = re.sub(r"\s+", "", number_match.group(1)) if number_match else extract_invoice_number(text)
+    if not re.fullmatch(r"[0-9]{8,30}", invoice_number):
+        invoice_number = ""
+    return Invoice(
+        path=str(path),
+        filename=path.name,
+        amount_cents=amount_cents,
+        invoice_type=classify_invoice(text),
+        invoice_date=extract_invoice_date(text),
+        invoice_number=invoice_number,
+        seller=extract_seller(text),
+        pages=pages,
+    )
 
 
 def xml_local_name(tag: str) -> str:
@@ -676,6 +794,8 @@ def parse_ofd_invoice(path: Path) -> Invoice:
 
 def parse_invoice(path: Path) -> Invoice:
     suffix = path.suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        return parse_image_invoice(path)
     if suffix == OFD_SUFFIX:
         return parse_ofd_invoice(path)
     if suffix != PDF_SUFFIX:
@@ -906,7 +1026,7 @@ def ensure_database() -> None:
     if DATABASE_INITIALIZED:
         return
     ensure_dirs()
-    with db_connect() as connection:
+    with closing(db_connect()) as connection, connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS used_invoices (
@@ -932,6 +1052,15 @@ def ensure_database() -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_used_invoices_number
             ON used_invoices(invoice_number)
             WHERE invoice_number <> ''
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invoice_type_overrides (
+                invoice_key TEXT PRIMARY KEY,
+                invoice_type TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
             """
         )
         migrate_used_records_json_to_db(connection)
@@ -1022,17 +1151,53 @@ def upsert_used_invoice_record(connection: sqlite3.Connection, record: dict) -> 
 
 def save_used_invoice_record(record: dict) -> None:
     ensure_database()
-    with db_connect() as connection:
+    with closing(db_connect()) as connection, connection:
         upsert_used_invoice_record(connection, record)
 
 
 def load_used_invoice_numbers() -> set[str]:
     ensure_database()
-    with db_connect() as connection:
+    with closing(db_connect()) as connection, connection:
         rows = connection.execute(
             "SELECT invoice_number FROM used_invoices WHERE invoice_number <> ''"
         ).fetchall()
     return {normalize_invoice_number_value(row["invoice_number"]) for row in rows}
+
+
+def invoice_type_override_key(invoice: Invoice) -> str:
+    invoice_number = normalize_invoice_number_value(invoice.invoice_number)
+    if invoice_number:
+        return f"number:{invoice_number}"
+    # Content identity keeps numberless invoices stable across file renames.
+    with Path(invoice.path).open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    return f"sha256:{digest}"
+
+
+def load_invoice_type_overrides() -> dict[str, str]:
+    ensure_database()
+    with closing(db_connect()) as connection, connection:
+        rows = connection.execute("SELECT invoice_key, invoice_type FROM invoice_type_overrides").fetchall()
+    return {row["invoice_key"]: row["invoice_type"] for row in rows if row["invoice_type"] in CATEGORIES[1:]}
+
+
+def save_invoice_type_override(invoice: Invoice, invoice_type: str | None) -> None:
+    if invoice_type is not None and invoice_type not in CATEGORIES[1:]:
+        raise ValueError("请选择有效的发票类型")
+    invoice_key = invoice_type_override_key(invoice)
+    ensure_database()
+    with closing(db_connect()) as connection, connection:
+        if invoice_type is None:
+            connection.execute("DELETE FROM invoice_type_overrides WHERE invoice_key = ?", (invoice_key,))
+        else:
+            connection.execute(
+                """
+                INSERT INTO invoice_type_overrides (invoice_key, invoice_type) VALUES (?, ?)
+                ON CONFLICT(invoice_key) DO UPDATE SET
+                    invoice_type = excluded.invoice_type, updated_at = CURRENT_TIMESTAMP
+                """,
+                (invoice_key, invoice_type),
+            )
 
 
 def load_last_target_amount() -> str:
@@ -1080,7 +1245,7 @@ def invoice_file_sort_key(path: Path) -> tuple[str, str]:
 
 
 def invoice_duplicate_keep_key(invoice: Invoice) -> tuple[int, str]:
-    suffix_rank = {PDF_SUFFIX: 0, OFD_SUFFIX: 1}.get(Path(invoice.path).suffix.lower(), 9)
+    suffix_rank = {PDF_SUFFIX: 0, OFD_SUFFIX: 1}.get(Path(invoice.path).suffix.lower(), 2)
     return suffix_rank, invoice.filename.lower()
 
 
@@ -1096,9 +1261,10 @@ def duplicate_record(moved_invoice: Invoice, kept_invoice: Invoice, target: Path
     }
 
 
-def scan_invoice_directory() -> tuple[list[Invoice], list[dict], list[dict], list[dict]]:
+def scan_invoice_directory(progress: Callable[[int, int, str], None] | None = None) -> tuple[list[Invoice], list[dict], list[dict], list[dict]]:
     ensure_dirs()
     used_invoice_numbers = load_used_invoice_numbers()
+    type_overrides = load_invoice_type_overrides()
     invoices: list[Invoice] = []
     failures: list[dict] = []
     reused: list[dict] = []
@@ -1112,7 +1278,12 @@ def scan_invoice_directory() -> tuple[list[Invoice], list[dict], list[dict], lis
         ),
         key=invoice_file_sort_key,
     )
-    for path in invoice_paths:
+    if any(path.suffix.lower() in IMAGE_SUFFIXES for path in invoice_paths):
+        with OCR_LOCK:
+            get_ocr_engine()
+    for index, path in enumerate(invoice_paths, 1):
+        if progress is not None:
+            progress(index, len(invoice_paths), path.name)
         try:
             invoice = parse_invoice(path)
             invoice_number = normalize_invoice_number_value(invoice.invoice_number)
@@ -1155,6 +1326,11 @@ def scan_invoice_directory() -> tuple[list[Invoice], list[dict], list[dict], lis
             }
             append_json_record(FAILED_RECORD_FILE, record)
             failures.append(record)
+    if type_overrides:
+        for index, invoice in enumerate(invoices):
+            invoice_type = type_overrides.get(invoice_type_override_key(invoice))
+            if invoice_type is not None:
+                invoices[index] = replace(invoice, invoice_type=invoice_type)
     invoices.sort(key=lambda item: (item.amount_cents, item.filename))
     return invoices, failures, reused, duplicates
 
@@ -1466,6 +1642,29 @@ def ofd_cache_pdf_path(ofd_path: Path) -> Path:
     return OFD_CACHE_DIR / f"{safe_stem}_{digest}.pdf"
 
 
+def image_cache_pdf_path(path: Path) -> Path:
+    with path.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    return PRINT_JOBS_DIR / "image_cache" / f"{IMAGE_RENDER_VERSION}_{digest}.pdf"
+
+
+def render_image_to_pdf(path: Path, output_path: Path) -> Path:
+    if Image is None or fitz is None:
+        raise RuntimeError("缺少 Pillow/PyMuPDF，无法预览或打印图片发票")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(path) as source, fitz.open() as pdf:
+        for index in range(getattr(source, "n_frames", 1)):
+            source.seek(index)
+            frame = image_rgb_frame(source)
+            width, height = frame.size
+            scale = 842 / max(width, height)
+            page = pdf.new_page(width=width * scale, height=height * scale)
+            pixmap = fitz.Pixmap(fitz.csRGB, width, height, frame.tobytes(), False)
+            page.insert_image(page.rect, pixmap=pixmap)
+        pdf.save(output_path, deflate=True)
+    return output_path
+
+
 def invoice_pdf_path(invoice: Invoice) -> Path:
     source = Path(invoice.path)
     if source.suffix.lower() == PDF_SUFFIX:
@@ -1474,6 +1673,11 @@ def invoice_pdf_path(invoice: Invoice) -> Path:
         target = ofd_cache_pdf_path(source)
         if not target.exists() or target.stat().st_mtime_ns < source.stat().st_mtime_ns:
             render_ofd_to_pdf(source, target)
+        return target
+    if source.suffix.lower() in IMAGE_SUFFIXES:
+        target = image_cache_pdf_path(source)
+        if not target.exists():
+            render_image_to_pdf(source, target)
         return target
     raise RuntimeError(f"不支持预览或打印的发票格式：{source.suffix}")
 
@@ -1495,7 +1699,7 @@ def merge_invoices_to_pdf(invoices: Iterable[Invoice]) -> Path:
 
     ensure_dirs()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = PRINT_JOBS_DIR / f"发票组合_{timestamp}.pdf"
+    output_path = unique_destination(PRINT_JOBS_DIR, f"发票组合_{timestamp}.pdf")
     writer = PdfWriter()
 
     for invoice in invoice_list:
@@ -1508,6 +1712,109 @@ def merge_invoices_to_pdf(invoices: Iterable[Invoice]) -> Path:
 
     with output_path.open("wb") as output:
         writer.write(output)
+    return output_path
+
+
+def export_combination_excel(
+    invoices: Iterable[Invoice],
+    output_path: Path,
+    target_cents: int | None = None,
+    page_counts: Iterable[int] | None = None,
+) -> Path:
+    invoice_list = list(invoices)
+    if not invoice_list:
+        raise ValueError("没有可导出的发票")
+    counts = list(page_counts) if page_counts is not None else [
+        count_pdf_pages(invoice_pdf_path(invoice)) for invoice in invoice_list
+    ]
+    if len(counts) != len(invoice_list) or any(count <= 0 for count in counts):
+        raise ValueError("发票页数无效，无法生成核对表")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    total_cents = sum(invoice.amount_cents for invoice in invoice_list)
+    total = total_cents / 100
+    last_row = 7 + len(invoice_list)
+    with xlsxwriter.Workbook(str(output_path), {"strings_to_formulas": False, "strings_to_urls": False}) as workbook:
+        workbook.set_properties({"title": "发票组合核对表", "author": "AutoInvoice"})
+        sheet = workbook.add_worksheet("发票核对")
+        body = {"font_name": "Microsoft YaHei", "font_size": 10, "valign": "vcenter"}
+        text_format = workbook.add_format(body)
+        number_format = workbook.add_format({**body, "num_format": "#,##0.00", "align": "right"})
+        id_format = workbook.add_format({**body, "num_format": "@", "align": "left", "quote_prefix": True})
+        center_format = workbook.add_format({**body, "align": "center"})
+        date_format = workbook.add_format({**body, "num_format": "yyyy-mm-dd", "align": "center"})
+        timestamp_format = workbook.add_format({**body, "num_format": "yyyy-mm-dd hh:mm", "align": "left"})
+        title_format = workbook.add_format({**body, "font_size": 14, "bold": True})
+        label_format = workbook.add_format({**body, "bold": True})
+        spaced_label_format = workbook.add_format({**body, "bold": True, "indent": 1})
+        header_format = workbook.add_format({**body, "bold": True, "font_color": "#FFFFFF", "bg_color": "#374151", "align": "center"})
+        file_format = workbook.add_format({**body, "text_wrap": True})
+        summary_format = workbook.add_format({**body, "num_format": "#,##0.00", "bold": True, "align": "right"})
+        link_format = workbook.add_format({**body, "font_color": "#1565C0", "underline": True})
+        sheet.hide_gridlines(2)
+        sheet.set_default_row(23)
+        sheet.set_column("A:A", 8, text_format)
+        sheet.set_column("B:B", 19, text_format)
+        sheet.set_column("C:C", 29, id_format)
+        sheet.set_column("D:D", 16, number_format)
+        sheet.set_column("E:E", 18, date_format)
+        sheet.set_column("F:F", 32, text_format)
+        sheet.set_column("G:G", 45, file_format)
+        sheet.set_column("H:H", 14, text_format)
+        sheet.set_row(1, 28)
+        sheet.write_string("A2", "发票组合核对表", title_format)
+        sheet.write_string("A3", "生成时间", label_format)
+        sheet.write_datetime("B3", datetime.now(), timestamp_format)
+        sheet.write_string("C3", "组合 PDF", spaced_label_format)
+        sheet.write_url("D3", "external:" + output_path.with_suffix(".pdf").name, link_format, string="打开组合 PDF")
+        sheet.write_string("A4", "报销金额", label_format)
+        if target_cents is not None:
+            sheet.write_number("B4", target_cents / 100, number_format)
+        sheet.write_string("C4", "组合金额（元）", spaced_label_format)
+        sheet.write_formula("D4", f"=ROUND(SUM(D8:D{last_row}),2)", summary_format, total)
+        sheet.write_string("E4", "差额（元）", spaced_label_format)
+        difference = (total_cents - target_cents) / 100 if target_cents is not None else ""
+        sheet.write_formula("F4", '=IF(ISNUMBER(B4),ROUND(D4-B4,2),"")', summary_format, difference)
+        sheet.write_string("A5", "发票张数", label_format)
+        sheet.write_formula("B5", f"=COUNT(A8:A{last_row})", label_format, len(invoice_list))
+        sheet.write_string("E5", "正数超出，负数不足", text_format)
+        columns = ["序号", "类型", "发票号码", "金额（元）", "开票日期", "销售方", "文件名", "预览页码"]
+        sheet.add_table(6, 0, last_row - 1, 7, {
+            "name": "InvoiceDetails",
+            "style": "Table Style Light 9",
+            "columns": [{"header": name, "header_format": header_format} for name in columns],
+        })
+        next_page = 1
+        for index, (invoice, pages) in enumerate(zip(invoice_list, counts), 7):
+            sheet.write_number(index, 0, index - 6, center_format)
+            sheet.write_string(index, 1, invoice.invoice_type, center_format)
+            sheet.write_string(index, 2, invoice.invoice_number, id_format)
+            sheet.write_number(index, 3, invoice.amount_cents / 100, number_format)
+            date_key = invoice_date_sort_key(invoice.invoice_date)
+            try:
+                date = datetime.strptime(str(date_key), "%Y%m%d")
+            except ValueError:
+                sheet.write_string(index, 4, invoice.invoice_date, text_format)
+            else:
+                sheet.write_datetime(index, 4, date, date_format)
+            sheet.write_string(index, 5, invoice.seller, file_format)
+            sheet.write_string(index, 6, invoice.filename, file_format)
+            end_page = next_page + pages - 1
+            page_range = str(next_page) if pages == 1 else f"{next_page}-{end_page}"
+            sheet.write_string(index, 7, page_range, center_format)
+            lines = max(
+                1,
+                *(max(1, (sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in value) + width - 1) // width)
+                  for value, width in ((invoice.seller, 32), (invoice.filename, 45))),
+            )
+            sheet.set_row(index, max(23, lines * 15 + 5))
+            next_page = end_page + 1
+        sheet.freeze_panes(7, 3)
+        sheet.set_landscape()
+        sheet.set_paper(9)
+        sheet.fit_to_pages(1, 0)
+        sheet.repeat_rows(6)
+        sheet.print_area(1, 0, last_row - 1, 7)
+        sheet.set_margins(0.25, 0.25, 0.4, 0.4)
     return output_path
 
 
@@ -1845,10 +2152,15 @@ class AutoInvoiceApp(tk.Tk):
         self.preview_zoom = 1.0
         self.preview_photo = None
         self.calculation_running = False
+        self.scanning_running = False
         self.calculate_button: ttk.Button | None = None
 
         self.target_var = tk.StringVar(value=load_last_target_amount())
-        self.category_var = tk.StringVar(value=CATEGORY_ALL)
+        self.category_vars = {
+            category: tk.BooleanVar(value=category == CATEGORY_ALL)
+            for category in CATEGORIES
+        }
+        self.invoice_type_var = tk.StringVar()
         self.status_var = tk.StringVar(value="准备就绪")
         self.summary_var = tk.StringVar(value="未计算")
         self.available_summary_var = tk.StringVar(value="共 0 张，合计 0.00 元")
@@ -1866,26 +2178,37 @@ class AutoInvoiceApp(tk.Tk):
         style.configure("Panel.TLabel", background="#ffffff")
         style.configure("Summary.TLabel", font=("Microsoft YaHei UI", 10, "bold"), background="#ffffff")
         style.configure("TButton", font=("Microsoft YaHei UI", 9))
+        style.configure("TMenubutton", font=("Microsoft YaHei UI", 9))
+        style.configure("TCheckbutton", background="#f6f7f9", font=("Microsoft YaHei UI", 9))
         style.configure("Treeview", font=("Microsoft YaHei UI", 9), rowheight=26)
         style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
 
         controls = ttk.Frame(self, padding=(14, 12, 14, 10))
         controls.pack(fill=tk.X)
+        actions = ttk.Frame(controls)
+        actions.pack(fill=tk.X)
 
-        ttk.Label(controls, text="报销金额").pack(side=tk.LEFT)
-        amount_entry = ttk.Entry(controls, textvariable=self.target_var, width=14)
+        ttk.Label(actions, text="报销金额").pack(side=tk.LEFT)
+        amount_entry = ttk.Entry(actions, textvariable=self.target_var, width=14)
         amount_entry.pack(side=tk.LEFT, padx=(6, 16))
         amount_entry.bind("<Return>", lambda _event: self.calculate())
 
-        ttk.Label(controls, text="发票类型").pack(side=tk.LEFT)
-        category_box = ttk.Combobox(controls, textvariable=self.category_var, values=CATEGORIES, width=10, state="readonly")
-        category_box.pack(side=tk.LEFT, padx=(6, 16))
-
-        self.calculate_button = ttk.Button(controls, text="计算组合", command=self.calculate)
+        self.calculate_button = ttk.Button(actions, text="计算组合", command=self.calculate)
         self.calculate_button.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(controls, text="扫描发票", command=self.scan).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(controls, text="发票目录", command=lambda: os.startfile(INVOICE_DIR)).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(controls, text="自动文件名", command=self.rename_files_by_invoice_number).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(actions, text="扫描发票", command=self.scan).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(actions, text="发票目录", command=lambda: os.startfile(INVOICE_DIR)).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(actions, text="自动文件名", command=self.rename_files_by_invoice_number).pack(side=tk.LEFT, padx=(0, 8))
+
+        category_controls = ttk.Frame(controls)
+        category_controls.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(category_controls, text="发票类型").pack(side=tk.LEFT, padx=(0, 6))
+        for category, variable in self.category_vars.items():
+            ttk.Checkbutton(
+                category_controls,
+                text=category,
+                variable=variable,
+                command=lambda selected=category: self.on_category_changed(selected),
+            ).pack(side=tk.LEFT, padx=(0, 12))
 
         main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 10))
@@ -1905,11 +2228,25 @@ class AutoInvoiceApp(tk.Tk):
         invoice_header = ttk.Frame(invoice_panel, style="Panel.TFrame")
         invoice_header.grid(row=0, column=0, sticky="ew")
         ttk.Label(invoice_header, text="可用发票", style="Summary.TLabel").pack(side=tk.LEFT)
+        type_button = ttk.Menubutton(invoice_header, text="设置类型")
+        type_button.pack(side=tk.LEFT, padx=(12, 0))
+        self.invoice_type_menu = tk.Menu(type_button, tearoff=False, postcommand=self.prepare_invoice_type_menu)
+        for category in CATEGORIES[1:]:
+            self.invoice_type_menu.add_radiobutton(
+                label=category,
+                value=category,
+                variable=self.invoice_type_var,
+                command=lambda selected=category: self.set_selected_invoice_type(selected),
+            )
+        self.invoice_type_menu.add_separator()
+        self.invoice_type_menu.add_command(label="恢复自动识别", command=lambda: self.set_selected_invoice_type(None))
+        type_button.configure(menu=self.invoice_type_menu)
         ttk.Label(invoice_header, textvariable=self.available_summary_var, style="Summary.TLabel").pack(side=tk.RIGHT)
         self.invoice_tree = self.create_tree(invoice_panel, show_status=True)
         self.invoice_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
         self.invoice_tree.bind("<<TreeviewSelect>>", lambda _event: self.preview_from_tree(self.invoice_tree, self.invoices))
         self.invoice_tree.bind("<Double-1>", self.add_available_invoice_to_result)
+        self.invoice_tree.bind("<Button-3>", self.show_invoice_type_menu)
 
         result_panel = ttk.Frame(left, style="Panel.TFrame", padding=10)
         result_panel.grid(row=1, column=0, sticky="nsew")
@@ -1972,9 +2309,40 @@ class AutoInvoiceApp(tk.Tk):
         self.update_idletasks()
 
     def scan(self) -> None:
+        if self.scanning_running or self.calculation_running:
+            return
+        self.scanning_running = True
+        self.invoices = []
+        self.clear_result()
+        self.available_summary_var.set("正在扫描...")
+        if self.calculate_button is not None:
+            self.calculate_button.configure(state=tk.DISABLED)
+        self.set_status("正在扫描 invoices...")
+
+        def progress(index: int, total: int, filename: str) -> None:
+            self.after(0, lambda: self.set_status(f"正在扫描 {index}/{total}：{filename}"))
+
+        def worker() -> None:
+            try:
+                result = scan_invoice_directory(progress)
+                self.after(0, lambda: self.on_scan_done(result, None))
+            except Exception as exc:
+                error = f"{exc}\n\n{traceback.format_exc()}"
+                self.after(0, lambda: self.on_scan_done(None, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_scan_done(self, result, error: str | None) -> None:
+        self.scanning_running = False
+        if self.calculate_button is not None:
+            self.calculate_button.configure(state=tk.NORMAL)
+        if error is not None:
+            self.update_available_summary()
+            messagebox.showerror("扫描失败", error)
+            self.set_status("扫描失败")
+            return
         try:
-            self.set_status("正在扫描 invoices...")
-            self.invoices, failures, reused, duplicates = scan_invoice_directory()
+            self.invoices, failures, reused, duplicates = result
             self.populate_tree(self.invoice_tree, self.invoices)
             self.update_available_summary()
             self.clear_result()
@@ -1991,6 +2359,8 @@ class AutoInvoiceApp(tk.Tk):
             self.set_status("扫描失败")
 
     def rename_files_by_invoice_number(self) -> None:
+        if self.scanning_running or self.calculation_running:
+            return
         try:
             self.set_status("正在按发票号码重命名...")
             renamed, unchanged, skipped = rename_invoice_files_by_number()
@@ -2013,6 +2383,57 @@ class AutoInvoiceApp(tk.Tk):
     def update_available_summary(self) -> None:
         total = sum(invoice.amount_cents for invoice in self.invoices)
         self.available_summary_var.set(f"共 {len(self.invoices)} 张，合计 {cents_to_text(total)} 元")
+
+    def prepare_invoice_type_menu(self) -> None:
+        invoice = self.selected_invoice_from_tree(self.invoice_tree, self.invoices)
+        self.invoice_type_var.set(invoice.invoice_type if invoice is not None else "")
+        state = tk.NORMAL if invoice is not None and not self.calculation_running else tk.DISABLED
+        for index in range(self.invoice_type_menu.index(tk.END) + 1):
+            if self.invoice_type_menu.type(index) != "separator":
+                self.invoice_type_menu.entryconfigure(index, state=state)
+
+    def show_invoice_type_menu(self, event) -> str:
+        item_id = self.invoice_tree.identify_row(event.y)
+        if item_id:
+            self.invoice_tree.selection_set(item_id)
+            self.invoice_tree.focus(item_id)
+            self.invoice_tree.focus_set()
+            try:
+                self.invoice_type_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.invoice_type_menu.grab_release()
+        return "break"
+
+    def set_selected_invoice_type(self, invoice_type: str | None) -> None:
+        invoice = self.selected_invoice_from_tree(self.invoice_tree, self.invoices)
+        if invoice is None or self.calculation_running:
+            return
+        try:
+            resolved_type = parse_invoice(Path(invoice.path)).invoice_type if invoice_type is None else invoice_type
+            save_invoice_type_override(invoice, invoice_type)
+        except Exception as exc:
+            self.invoice_type_var.set(invoice.invoice_type)
+            messagebox.showerror("设置类型失败", str(exc))
+            return
+
+        updated_invoice = replace(invoice, invoice_type=resolved_type)
+        self.invoices = [updated_invoice if item.path == invoice.path else item for item in self.invoices]
+        self.result_invoices = [updated_invoice if item.path == invoice.path else item for item in self.result_invoices]
+        for tree, invoices in ((self.invoice_tree, self.invoices), (self.result_tree, self.result_invoices)):
+            for index, item in enumerate(invoices):
+                if item.path == invoice.path:
+                    tree.set(str(index), "type", resolved_type)
+
+        if any(item.path == invoice.path for item in self.print_preview_invoices):
+            if self.preview_invoice is not None and self.preview_invoice.path == str(self.print_preview_pdf):
+                self.preview_invoice = updated_invoice
+                self.preview_page = 0
+            self.reset_print_preview()
+        if self.preview_invoice is not None and self.preview_invoice.path == invoice.path:
+            self.preview_invoice = updated_invoice
+        self.invoice_type_var.set(resolved_type)
+        self.render_preview()
+        self.set_status(f"已更新类型：{invoice.filename} → {resolved_type}")
 
     def populate_tree(self, tree: ttk.Treeview, invoices: list[Invoice]) -> None:
         tree.delete(*tree.get_children())
@@ -2097,14 +2518,24 @@ class AutoInvoiceApp(tk.Tk):
             return None
         return cents
 
+    def on_category_changed(self, category: str) -> None:
+        if category == CATEGORY_ALL and self.category_vars[CATEGORY_ALL].get():
+            for name, variable in self.category_vars.items():
+                if name != CATEGORY_ALL:
+                    variable.set(False)
+        else:
+            self.category_vars[CATEGORY_ALL].set(
+                not any(variable.get() for name, variable in self.category_vars.items() if name != CATEGORY_ALL)
+            )
+
     def filtered_invoices(self) -> list[Invoice]:
-        category = self.category_var.get() or CATEGORY_ALL
-        if category == CATEGORY_ALL:
+        categories = {name for name, variable in self.category_vars.items() if variable.get()}
+        if not categories or CATEGORY_ALL in categories:
             return self.invoices
-        return [invoice for invoice in self.invoices if invoice.invoice_type == category]
+        return [invoice for invoice in self.invoices if invoice.invoice_type in categories]
 
     def calculate(self) -> None:
-        if self.calculation_running:
+        if self.calculation_running or self.scanning_running:
             return
         self.clear_result()
         target = self.target_cents()
@@ -2293,6 +2724,9 @@ class AutoInvoiceApp(tk.Tk):
         try:
             merged_pdf = merge_invoices_to_pdf(invoices)
             page_count = count_pdf_pages(merged_pdf)
+            excel_path = export_combination_excel(
+                invoices, merged_pdf.with_suffix(".xlsx"), parse_money_to_cents(self.target_var.get().strip())
+            )
             total = sum(invoice.amount_cents for invoice in invoices)
             self.preview_invoice = Invoice(
                 path=str(merged_pdf),
@@ -2305,12 +2739,19 @@ class AutoInvoiceApp(tk.Tk):
             self.print_preview_invoices = invoices
             self.preview_page = 0
             self.render_preview()
-            self.set_status(f"已生成组合预览：{merged_pdf.name}")
+            self.set_status(f"已生成组合预览及 Excel 核对表：{merged_pdf.name}")
         except Exception as exc:
-            messagebox.showerror("合并 PDF 失败", f"{exc}\n\n{traceback.format_exc()}")
+            messagebox.showerror("生成组合预览失败", f"{exc}\n\n{traceback.format_exc()}")
             return
 
-        messagebox.showinfo("组合预览已生成", f"已生成合并 PDF，共 {len(invoices)} 张发票、{page_count} 页。\n\n确认无误后，可在右侧预览区点击“打印”。")
+        if messagebox.askyesno(
+            "组合预览已生成",
+            f"已生成合并 PDF，共 {len(invoices)} 张发票、{page_count} 页。\n\nExcel 核对表：\n{excel_path}\n\n是否打开 Excel 核对表？",
+        ):
+            try:
+                os.startfile(excel_path)
+            except OSError as exc:
+                messagebox.showwarning("无法打开核对表", f"核对表已保存，请使用 Excel 或 WPS 打开：\n{excel_path}\n\n{exc}")
 
     def print_preview_pdf_file(self) -> None:
         if self.preview_invoice is None:

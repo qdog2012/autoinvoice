@@ -1,3 +1,5 @@
+param([switch]$SkipDependencyInstall)
+
 $ErrorActionPreference = "Stop"
 
 $version = "v1.$(Get-Date -Format 'MMdd.HHmm')"
@@ -17,7 +19,10 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($sourcePath, $updatedSourceText, $utf8NoBom)
 Write-Host "Version: $version"
 
-python -m pip install -r requirements.txt
+if (-not $SkipDependencyInstall) {
+  python -m pip install -r requirements.txt
+  if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
+}
 
 $pythonPrefix = python -c "import sys; print(sys.prefix)"
 $libraryBin = Join-Path $pythonPrefix "Library\bin"
@@ -29,7 +34,9 @@ $pyInstallerArgs = @(
   "--onefile",
   "--clean",
   "--name", "AutoInvoice",
-  "--hidden-import", "win32timezone"
+  "--hidden-import", "win32timezone",
+  "--collect-all", "rapidocr",
+  "--collect-binaries", "onnxruntime"
 )
 
 if (Test-Path $libraryBin) {
@@ -53,6 +60,7 @@ if (Test-Path $tkLibrary) {
 $pyInstallerArgs += "autoinvoice.py"
 
 python -m PyInstaller @pyInstallerArgs
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed" }
 
 Copy-Item -Path "dist\AutoInvoice.exe" -Destination "AutoInvoice.exe" -Force
 
