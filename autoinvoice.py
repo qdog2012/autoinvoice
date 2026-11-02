@@ -14,7 +14,7 @@ import unicodedata
 import ctypes
 import hashlib
 import zipfile
-from contextlib import closing
+from contextlib import closing, suppress
 from ctypes import wintypes
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -66,7 +66,7 @@ LEGACY_RUNTIME_FILES = (
     (APP_DIR / "app_settings.json", SETTINGS_FILE),
     (APP_DIR / "invoice_records.sqlite3", DATABASE_FILE),
 )
-APP_VERSION = "v1.1013.1323"
+APP_VERSION = "v1.1102.1822"
 
 CATEGORY_ALL = "全部"
 CATEGORIES = [CATEGORY_ALL, "交通", "餐饮", "住宿", "办公", "其他"]
@@ -830,12 +830,12 @@ def unique_destination(directory: Path, filename: str) -> Path:
         return target
     stem = target.stem
     suffix = target.suffix
-    for index in range(1, 1000):
+    index = 1
+    while True:
         candidate = directory / f"{stem}_{index}{suffix}"
         if not candidate.exists():
             return candidate
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return directory / f"{stem}_{timestamp}{suffix}"
+        index += 1
 
 
 def archive_legacy_runtime_file(source: Path) -> None:
@@ -906,11 +906,13 @@ def safe_filename_component(value: str) -> str:
         "PRN",
         "AUX",
         "NUL",
-        *(f"COM{index}" for index in range(1, 10)),
-        *(f"LPT{index}" for index in range(1, 10)),
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{index}" for index in "123456789\u00b9\u00b2\u00b3"),
+        *(f"LPT{index}" for index in "123456789\u00b9\u00b2\u00b3"),
     }
-    if cleaned.upper() in reserved_names:
-        cleaned = f"{cleaned}_"
+    if cleaned.partition(".")[0].rstrip(" ").upper() in reserved_names:
+        cleaned = f"_{cleaned}"
     return cleaned
 
 
@@ -1235,7 +1237,10 @@ def move_invoice(path: Path, directory: Path) -> Path:
 def move_previously_used_invoice(path: Path) -> tuple[Path, str]:
     USED_DIR.mkdir(parents=True, exist_ok=True)
     VOID_DIR.mkdir(parents=True, exist_ok=True)
-    if (USED_DIR / path.name).exists():
+    if (USED_DIR / path.name).exists() or any(
+        archived.is_file() and archived.name.casefold() == path.name.casefold()
+        for archived in USED_DIR.rglob("*")
+    ):
         return move_invoice(path, VOID_DIR), "void_invoices"
     return move_invoice(path, USED_DIR), "used_invoices"
 
@@ -1692,6 +1697,15 @@ def count_pdf_pages(path: Path) -> int:
             return len(doc)
 
 
+def unique_pdf_excel_destination(directory: Path, filename: str) -> Path:
+    target = directory / filename
+    index = 1
+    while target.exists() or target.with_suffix(".xlsx").exists():
+        target = directory / f"{Path(filename).stem}_{index}.pdf"
+        index += 1
+    return target
+
+
 def merge_invoices_to_pdf(invoices: Iterable[Invoice]) -> Path:
     invoice_list = list(invoices)
     if not invoice_list:
@@ -1699,7 +1713,7 @@ def merge_invoices_to_pdf(invoices: Iterable[Invoice]) -> Path:
 
     ensure_dirs()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = unique_destination(PRINT_JOBS_DIR, f"发票组合_{timestamp}.pdf")
+    output_path = unique_pdf_excel_destination(PRINT_JOBS_DIR, f"发票组合_{timestamp}.pdf")
     writer = PdfWriter()
 
     for invoice in invoice_list:
@@ -1710,8 +1724,13 @@ def merge_invoices_to_pdf(invoices: Iterable[Invoice]) -> Path:
         for page in reader.pages:
             writer.add_page(page)
 
-    with output_path.open("wb") as output:
-        writer.write(output)
+    try:
+        with output_path.open("wb") as output:
+            writer.write(output)
+    except Exception:
+        with suppress(OSError):
+            output_path.unlink(missing_ok=True)
+        raise
     return output_path
 
 
@@ -1816,6 +1835,56 @@ def export_combination_excel(
         sheet.print_area(1, 0, last_row - 1, 7)
         sheet.set_margins(0.25, 0.25, 0.4, 0.4)
     return output_path
+
+
+def archive_combination_documents(
+    invoices: list[Invoice],
+    directory: Path,
+    target_cents: int | None,
+    preview_pdf: Path | None = None,
+) -> tuple[Path, Path]:
+    if not invoices:
+        raise ValueError("没有可归档的发票")
+    if preview_pdf is None or not preview_pdf.is_file() or not preview_pdf.with_suffix(".xlsx").is_file():
+        ordered = sorted(invoices, key=invoice_type_sort_key)
+        preview_pdf = merge_invoices_to_pdf(ordered)
+        try:
+            export_combination_excel(ordered, preview_pdf.with_suffix(".xlsx"), target_cents)
+        except Exception:
+            for path in (preview_pdf, preview_pdf.with_suffix(".xlsx")):
+                with suppress(OSError):
+                    path.unlink(missing_ok=True)
+            raise
+
+    directory.mkdir(parents=True, exist_ok=True)
+    destination_pdf = unique_pdf_excel_destination(directory, preview_pdf.name)
+    destination_excel = destination_pdf.with_suffix(".xlsx")
+    source_excel = preview_pdf.with_suffix(".xlsx")
+    try:
+        shutil.copy2(preview_pdf, destination_pdf)
+        if destination_pdf.name == preview_pdf.name:
+            shutil.copy2(source_excel, destination_excel)
+        else:
+            # Preserve workbook edits while retargeting its relative PDF hyperlink.
+            with zipfile.ZipFile(source_excel) as source, zipfile.ZipFile(destination_excel, "w") as output:
+                for entry in source.infolist():
+                    data = source.read(entry.filename)
+                    if entry.filename.endswith(".rels"):
+                        relationships = ET.fromstring(data)
+                        changed = False
+                        for relationship in relationships:
+                            if relationship.get("Type", "").endswith("/hyperlink") and relationship.get("Target") == preview_pdf.name:
+                                relationship.set("Target", destination_pdf.name)
+                                changed = True
+                        if changed:
+                            data = ET.tostring(relationships, encoding="utf-8", xml_declaration=True)
+                    output.writestr(entry, data)
+    except Exception:
+        for path in (destination_pdf, destination_excel):
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+        raise
+    return destination_pdf, destination_excel
 
 
 def find_best_combination(invoices: list[Invoice], target_cents: int) -> list[Invoice]:
@@ -2156,6 +2225,7 @@ class AutoInvoiceApp(tk.Tk):
         self.calculate_button: ttk.Button | None = None
 
         self.target_var = tk.StringVar(value=load_last_target_amount())
+        self.content_var = tk.StringVar(value="报销")
         self.category_vars = {
             category: tk.BooleanVar(value=category == CATEGORY_ALL)
             for category in CATEGORIES
@@ -2188,10 +2258,13 @@ class AutoInvoiceApp(tk.Tk):
         actions = ttk.Frame(controls)
         actions.pack(fill=tk.X)
 
-        ttk.Label(actions, text="报销金额").pack(side=tk.LEFT)
-        amount_entry = ttk.Entry(actions, textvariable=self.target_var, width=14)
+        ttk.Label(actions, text="金额").pack(side=tk.LEFT)
+        amount_entry = ttk.Entry(actions, textvariable=self.target_var, width=9)
         amount_entry.pack(side=tk.LEFT, padx=(6, 16))
         amount_entry.bind("<Return>", lambda _event: self.calculate())
+
+        ttk.Label(actions, text="内容：").pack(side=tk.LEFT)
+        ttk.Entry(actions, textvariable=self.content_var, width=16).pack(side=tk.LEFT, padx=(6, 16))
 
         self.calculate_button = ttk.Button(actions, text="计算组合", command=self.calculate)
         self.calculate_button.pack(side=tk.LEFT, padx=(0, 8))
@@ -2231,15 +2304,19 @@ class AutoInvoiceApp(tk.Tk):
         type_button = ttk.Menubutton(invoice_header, text="设置类型")
         type_button.pack(side=tk.LEFT, padx=(12, 0))
         self.invoice_type_menu = tk.Menu(type_button, tearoff=False, postcommand=self.prepare_invoice_type_menu)
-        for category in CATEGORIES[1:]:
-            self.invoice_type_menu.add_radiobutton(
-                label=category,
-                value=category,
-                variable=self.invoice_type_var,
-                command=lambda selected=category: self.set_selected_invoice_type(selected),
-            )
-        self.invoice_type_menu.add_separator()
-        self.invoice_type_menu.add_command(label="恢复自动识别", command=lambda: self.set_selected_invoice_type(None))
+        self.invoice_context_menu = tk.Menu(self, tearoff=False, postcommand=self.prepare_invoice_type_menu)
+        for menu in (self.invoice_type_menu, self.invoice_context_menu):
+            for category in CATEGORIES[1:]:
+                menu.add_radiobutton(
+                    label=category,
+                    value=category,
+                    variable=self.invoice_type_var,
+                    command=lambda selected=category: self.set_selected_invoice_type(selected),
+                )
+            menu.add_separator()
+            menu.add_command(label="恢复自动识别", command=lambda: self.set_selected_invoice_type(None))
+        self.invoice_context_menu.add_separator()
+        self.invoice_context_menu.add_command(label="删除", command=self.delete_selected_invoice)
         type_button.configure(menu=self.invoice_type_menu)
         ttk.Label(invoice_header, textvariable=self.available_summary_var, style="Summary.TLabel").pack(side=tk.RIGHT)
         self.invoice_tree = self.create_tree(invoice_panel, show_status=True)
@@ -2387,10 +2464,11 @@ class AutoInvoiceApp(tk.Tk):
     def prepare_invoice_type_menu(self) -> None:
         invoice = self.selected_invoice_from_tree(self.invoice_tree, self.invoices)
         self.invoice_type_var.set(invoice.invoice_type if invoice is not None else "")
-        state = tk.NORMAL if invoice is not None and not self.calculation_running else tk.DISABLED
-        for index in range(self.invoice_type_menu.index(tk.END) + 1):
-            if self.invoice_type_menu.type(index) != "separator":
-                self.invoice_type_menu.entryconfigure(index, state=state)
+        state = tk.NORMAL if invoice is not None and not self.calculation_running and not self.scanning_running else tk.DISABLED
+        for menu in (self.invoice_type_menu, self.invoice_context_menu):
+            for index in range(menu.index(tk.END) + 1):
+                if menu.type(index) != "separator":
+                    menu.entryconfigure(index, state=state)
 
     def show_invoice_type_menu(self, event) -> str:
         item_id = self.invoice_tree.identify_row(event.y)
@@ -2399,10 +2477,31 @@ class AutoInvoiceApp(tk.Tk):
             self.invoice_tree.focus(item_id)
             self.invoice_tree.focus_set()
             try:
-                self.invoice_type_menu.tk_popup(event.x_root, event.y_root)
+                self.invoice_context_menu.tk_popup(event.x_root, event.y_root)
             finally:
-                self.invoice_type_menu.grab_release()
+                self.invoice_context_menu.grab_release()
         return "break"
+
+    def delete_selected_invoice(self) -> None:
+        if self.calculation_running or self.scanning_running:
+            return
+        invoice = self.selected_invoice_from_tree(self.invoice_tree, self.invoices)
+        if invoice is None:
+            return
+        source = Path(invoice.path)
+        if not messagebox.askyesno(
+            "确认删除发票",
+            f"确定永久删除这张发票吗？\n\n{invoice.filename}\n{source}\n\n不进入回收站，删除后无法恢复。",
+            icon="warning", default=messagebox.NO, parent=self,
+        ):
+            return
+        try:
+            source.unlink(missing_ok=True)
+        except OSError as exc:
+            messagebox.showerror("删除失败", f"无法删除 {invoice.filename}：\n{exc}", parent=self)
+            return
+        self.refresh_after_moved({invoice.path})
+        self.set_status(f"已删除：{invoice.filename}")
 
     def set_selected_invoice_type(self, invoice_type: str | None) -> None:
         invoice = self.selected_invoice_from_tree(self.invoice_tree, self.invoices)
@@ -2514,7 +2613,7 @@ class AutoInvoiceApp(tk.Tk):
         value = self.target_var.get().strip()
         cents = parse_money_to_cents(value)
         if cents is None or cents <= 0:
-            messagebox.showwarning("金额无效", "请输入大于 0 的报销金额，例如 1200.50")
+            messagebox.showwarning("金额无效", "请输入大于 0 的金额，例如 1200.50")
             return None
         return cents
 
@@ -2828,8 +2927,16 @@ class AutoInvoiceApp(tk.Tk):
             messagebox.showwarning("没有发票", "当前没有可标记的发票")
             return
         target = self.target_var.get().strip()
+        content = safe_filename_component(self.content_var.get()) or "报销"
+        archive_dir = USED_DIR / f"{content}{datetime.now():%Y%m%d}"
+        preview_by_path = {invoice.path: invoice for invoice in self.print_preview_invoices}
+        preview_pdf = self.print_preview_pdf if (
+            len(invoices) == len(preview_by_path)
+            and all(preview_by_path.get(invoice.path) == invoice for invoice in invoices)
+        ) else None
         moved = 0
         moved_paths: set[str] = set()
+        archived_invoices: list[Invoice] = []
         errors: list[str] = []
         for invoice in invoices:
             source = Path(invoice.path)
@@ -2837,7 +2944,7 @@ class AutoInvoiceApp(tk.Tk):
                 errors.append(f"{invoice.filename}: 文件不存在")
                 continue
             try:
-                destination = move_invoice(source, USED_DIR)
+                destination = move_invoice(source, archive_dir)
                 record = asdict(invoice)
                 record.update(
                     {
@@ -2850,15 +2957,28 @@ class AutoInvoiceApp(tk.Tk):
                 append_json_record(STATE_FILE, record)
                 moved += 1
                 moved_paths.add(invoice.path)
+                archived_invoices.append(replace(invoice, path=str(destination), filename=destination.name))
             except Exception as exc:
                 errors.append(f"{invoice.filename}: {exc}")
 
+        if archived_invoices:
+            try:
+                can_reuse_preview = moved == len(invoices) and all(
+                    original.filename == archived.filename
+                    for original, archived in zip(invoices, archived_invoices)
+                )
+                archive_combination_documents(
+                    archived_invoices, archive_dir, parse_money_to_cents(target),
+                    preview_pdf if can_reuse_preview else None,
+                )
+            except Exception as exc:
+                errors.append(f"发票已归档到 {archive_dir}，但 PDF/Excel 核对文件归档失败：{exc}")
         if moved_paths:
             self.refresh_after_moved(moved_paths)
         if errors:
-            messagebox.showwarning("部分移动失败", "\n".join(errors))
+            messagebox.showwarning("部分归档未完成", "\n".join(errors))
         else:
-            messagebox.showinfo("已标记", f"已移动 {moved} 张发票到 used_invoices")
+            messagebox.showinfo("已标记", f"已归档 {moved} 张发票、合并 PDF 及 Excel 核对表到：\n{archive_dir}")
 
 
 def print_scan_json() -> int:

@@ -175,7 +175,7 @@ class InvoiceTypeOverrideTests(unittest.TestCase):
         app = self.make_app([first, second])
         app.invoice_tree.selection_set("0")
         event = SimpleNamespace(y=0, x_root=100, y_root=100)
-        with patch.object(app.invoice_tree, "identify_row", return_value="1"), patch.object(app.invoice_type_menu, "tk_popup"), patch.object(app.invoice_type_menu, "grab_release"):
+        with patch.object(app.invoice_tree, "identify_row", return_value="1"), patch.object(app.invoice_context_menu, "tk_popup"), patch.object(app.invoice_context_menu, "grab_release"):
             self.assertEqual(app.show_invoice_type_menu(event), "break")
         self.assertEqual(app.invoice_tree.selection(), ("1",))
         app.set_selected_invoice_type(self.traffic)
