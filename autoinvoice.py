@@ -66,7 +66,7 @@ LEGACY_RUNTIME_FILES = (
     (APP_DIR / "app_settings.json", SETTINGS_FILE),
     (APP_DIR / "invoice_records.sqlite3", DATABASE_FILE),
 )
-APP_VERSION = "v1.1102.1822"
+APP_VERSION = "v1.1103.1403"
 
 CATEGORY_ALL = "全部"
 CATEGORIES = [CATEGORY_ALL, "交通", "餐饮", "住宿", "办公", "其他"]
@@ -254,6 +254,60 @@ def read_pdf_text_with_fitz(path: Path) -> tuple[str, int]:
         return normalize_text(text), len(doc)
 
 
+def cluster_visual_rows(items: Iterable[tuple[float, float, float, float, str]]) -> list[str]:
+    """Rebuild visual text rows from positioned text runs.
+
+    Many e-invoices draw each cell as its own text object, so the reading order
+    produced by the PDF text extractor is not the visual order. Grouping runs by
+    vertical overlap and then ordering them by x restores the row a human sees.
+    """
+    rows: list[list] = []
+    for x0, y0, x1, y1, text in sorted(items, key=lambda item: (item[1], item[0])):
+        height = max(y1 - y0, 0.1)
+        target = None
+        best_ratio = 0.0
+        for row in rows:
+            overlap = min(row[1], y1) - max(row[0], y0)
+            ratio = overlap / min(height, max(row[1] - row[0], 0.1))
+            if ratio > best_ratio:
+                best_ratio = ratio
+                target = row
+        if target is not None and best_ratio >= 0.45:
+            target[0] = min(target[0], y0)
+            target[1] = max(target[1], y1)
+            target[2].append((x0, text))
+        else:
+            rows.append([y0, y1, [(x0, text)]])
+    rows.sort(key=lambda row: row[0])
+    return [
+        " ".join(text for _, text in sorted(row[2], key=lambda part: part[0]))
+        for row in rows
+    ]
+
+
+def read_pdf_visual_rows(path: Path) -> list[str]:
+    if fitz is None:
+        return []
+    lines: list[str] = []
+    try:
+        with fitz.open(path) as doc:
+            for page in doc:
+                items: list[tuple[float, float, float, float, str]] = []
+                for block in page.get_text("dict").get("blocks", []):
+                    if block.get("type") != 0:
+                        continue
+                    for line in block.get("lines", []):
+                        text = "".join(span.get("text", "") for span in line.get("spans", []))
+                        if not text.strip():
+                            continue
+                        x0, y0, x1, y1 = line.get("bbox")
+                        items.append((x0, y0, x1, y1, text))
+                lines.extend(cluster_visual_rows(items))
+    except Exception:
+        return []
+    return lines
+
+
 def get_ocr_engine():
     global OCR_ENGINE
     if OCR_ENGINE is None:
@@ -333,6 +387,9 @@ def read_image_text(path: Path) -> tuple[str, int]:
 def extract_image_amount_cents(text: str) -> int | None:
     text = normalize_text(text)
     text = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", text)
+    row_cents = amount_cents_from_visual_rows(text.splitlines())
+    if row_cents is not None:
+        return row_cents
     # OCR may lose the currency symbol. Only allow that fallback beside a total label.
     for label in (r"小\s*写", r"价\s*税\s*合\s*计", r"(?:实收金额|金额合计|总金额)"):
         match = re.search(label + r"[)）:：\s]*[¥Y]?\s*([0-9][0-9, ]*\.[0-9]{2})(?![0-9])", text)
@@ -467,7 +524,17 @@ def collect_ofd_text_runs(root: ET.Element) -> list[tuple[float, float, str]]:
     return runs
 
 
-def read_ofd_text(path: Path) -> tuple[str, int, dict[str, str], list[str]]:
+def ofd_visual_rows(runs: Iterable[tuple[float, float, str]]) -> list[str]:
+    rows: list[list] = []
+    for y, x, text in sorted(runs, key=lambda run: (run[0], run[1])):
+        if rows and abs(y - rows[-1][0]) <= 3.0:
+            rows[-1][2].append((x, text))
+        else:
+            rows.append([y, 0.0, [(x, text)]])
+    return [" ".join(text for _, text in sorted(row[2], key=lambda part: part[0])) for row in rows]
+
+
+def read_ofd_text(path: Path) -> tuple[str, int, dict[str, str], list[str], list[str]]:
     try:
         with zipfile.ZipFile(path) as zip_file:
             custom_data = collect_ofd_custom_data(zip_file)
@@ -486,14 +553,17 @@ def read_ofd_text(path: Path) -> tuple[str, int, dict[str, str], list[str]]:
                 )
 
             body_values: list[str] = []
+            visual_rows: list[str] = []
             all_values: list[str] = [f"{key}: {value}" for key, value in custom_data.items()]
             for page_path in page_paths:
                 try:
                     page_root = read_ofd_xml(zip_file, page_path)
                 except Exception:
                     continue
-                page_values = [text for _, _, text in sorted(collect_ofd_text_runs(page_root))]
+                runs = collect_ofd_text_runs(page_root)
+                page_values = [text for _, _, text in sorted(runs)]
                 body_values.extend(page_values)
+                visual_rows.extend(ofd_visual_rows(runs))
                 all_values.extend(page_values)
 
             if not all_values:
@@ -507,7 +577,13 @@ def read_ofd_text(path: Path) -> tuple[str, int, dict[str, str], list[str]]:
                     all_values.extend(text for _, _, text in sorted(collect_ofd_text_runs(root)))
 
             page_count = max(len(page_paths), 1)
-            return normalize_text("\n".join(all_values)), page_count, custom_data, body_values
+            return (
+                normalize_text("\n".join(all_values)),
+                page_count,
+                custom_data,
+                body_values,
+                [normalize_text(row) for row in visual_rows],
+            )
     except zipfile.BadZipFile as exc:
         raise ValueError("OFD 文件格式无效或已损坏") from exc
 
@@ -517,6 +593,104 @@ def safe_float(value: object, default: float = 0.0) -> float:
         return float(str(value).strip())
     except Exception:
         return default
+
+
+UPPERCASE_DIGITS = {
+    "零": 0, "〇": 0, "壹": 1, "贰": 2, "叁": 3, "肆": 4,
+    "伍": 5, "陆": 6, "柒": 7, "捌": 8, "玖": 9,
+}
+UPPERCASE_UNITS = {"拾": 10, "佰": 100, "仟": 1000}
+UPPERCASE_AMOUNT_CHARS = "".join(UPPERCASE_DIGITS) + "拾佰仟万亿元圆角分整正"
+UPPERCASE_AMOUNT_RE = re.compile(r"[" + UPPERCASE_AMOUNT_CHARS + r"]{2,}")
+TOTAL_AMOUNT_LABEL_RE = re.compile(r"价\s*税\s*合\s*计|小\s*写")
+AMOUNT_TOKEN_RE = re.compile(r"(?:[¥￥]\s*)?(\d{1,3}(?:,\d{3})+|\d+)\.(\d{2})(?!\d)")
+
+
+def parse_uppercase_amount_cents(text: str) -> int | None:
+    """Parse a Chinese uppercase amount such as 壹佰伍拾肆圆伍角整."""
+    match = UPPERCASE_AMOUNT_RE.search(normalize_text(text))
+    if not match:
+        return None
+    value = match.group(0)
+    if "元" not in value and "圆" not in value:
+        return None
+    total = 0
+    section = 0
+    number = 0
+    jiao = 0
+    fen = 0
+    for char in value:
+        if char in UPPERCASE_DIGITS:
+            number = UPPERCASE_DIGITS[char]
+        elif char in UPPERCASE_UNITS:
+            section += (number or 1) * UPPERCASE_UNITS[char]
+            number = 0
+        elif char == "万":
+            section = (section + number) * 10000
+            total += section
+            section = 0
+            number = 0
+        elif char in ("元", "圆"):
+            total += section + number
+            section = 0
+            number = 0
+        elif char == "角":
+            jiao = number
+            number = 0
+        elif char == "分":
+            fen = number
+            number = 0
+    return total * 100 + jiao * 10 + fen
+
+
+def amount_tokens_in_line(line: str) -> list[int]:
+    line = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", line)
+    values: list[int] = []
+    for match in AMOUNT_TOKEN_RE.finditer(line):
+        start, end = match.span()
+        if start > 0 and (line[start - 1].isdigit() or line[start - 1] == "."):
+            continue
+        if end < len(line) and (line[end].isdigit() or line[end] == "."):
+            continue
+        cents = parse_money_to_cents(match.group(1) + "." + match.group(2))
+        if cents is not None:
+            values.append(cents)
+    return values
+
+
+def choose_row_amount_cents(line: str, tokens: list[int]) -> int | None:
+    if not tokens:
+        return None
+    if len(tokens) == 1:
+        return tokens[0]
+    uppercase_cents = parse_uppercase_amount_cents(line)
+    if uppercase_cents is not None and uppercase_cents in tokens:
+        return uppercase_cents
+    # The 价税合计 value is the rightmost amount on its row.
+    return tokens[-1]
+
+
+def amount_cents_from_visual_rows(rows: Iterable[str]) -> int | None:
+    """Read 价税合计 from visual rows instead of the raw PDF text stream."""
+    lines = [row for row in rows if row and row.strip()]
+    if not lines:
+        return None
+    for line in lines:
+        if TOTAL_AMOUNT_LABEL_RE.search(line):
+            tokens = amount_tokens_in_line(line)
+            if tokens:
+                return choose_row_amount_cents(line, tokens)
+    for line in lines:
+        if UPPERCASE_AMOUNT_RE.search(line):
+            tokens = amount_tokens_in_line(line)
+            if tokens:
+                return choose_row_amount_cents(line, tokens)
+    for line in lines:
+        if UPPERCASE_AMOUNT_RE.search(line):
+            uppercase_cents = parse_uppercase_amount_cents(line)
+            if uppercase_cents is not None:
+                return uppercase_cents
+    return None
 
 
 def money_values_in(text: str) -> list[int]:
@@ -530,6 +704,10 @@ def money_values_in(text: str) -> list[int]:
 
 def extract_amount_cents(text: str) -> int | None:
     text = normalize_text(text)
+    row_cents = amount_cents_from_visual_rows(text.splitlines())
+    if row_cents is not None:
+        return row_cents
+
     candidates: list[int] = []
 
     for match in re.finditer(r"(?:小写|价税合计)", text):
@@ -546,6 +724,13 @@ def extract_amount_cents(text: str) -> int | None:
     return None
 
 
+def read_pdf_amount_cents(path: Path, text: str) -> int | None:
+    row_cents = amount_cents_from_visual_rows(read_pdf_visual_rows(path))
+    if row_cents is not None:
+        return row_cents
+    return extract_amount_cents(text)
+
+
 def money_from_custom_value(value: object) -> int | None:
     text = normalize_text(str(value or ""))
     text = text.replace("元", "").strip()
@@ -553,7 +738,11 @@ def money_from_custom_value(value: object) -> int | None:
     return parse_money_to_cents(text)
 
 
-def extract_ofd_amount_cents(custom_data: dict[str, str], text: str) -> int | None:
+def extract_ofd_amount_cents(
+    custom_data: dict[str, str],
+    text: str,
+    visual_rows: Iterable[str] | None = None,
+) -> int | None:
     compact_custom = {re.sub(r"\s+", "", key): value for key, value in custom_data.items()}
     for key in ("价税合计", "价税合计小写", "合计价税", "金额合计", "总金额"):
         cents = money_from_custom_value(compact_custom.get(key))
@@ -566,6 +755,10 @@ def extract_ofd_amount_cents(custom_data: dict[str, str], text: str) -> int | No
         return amount_without_tax + tax_amount
     if amount_without_tax is not None:
         return amount_without_tax
+    if visual_rows is not None:
+        row_cents = amount_cents_from_visual_rows(visual_rows)
+        if row_cents is not None:
+            return row_cents
     return extract_amount_cents(text)
 
 
@@ -769,8 +962,8 @@ def extract_ofd_seller(custom_data: dict[str, str], body_values: list[str], text
 
 
 def parse_ofd_invoice(path: Path) -> Invoice:
-    text, pages, custom_data, body_values = read_ofd_text(path)
-    amount_cents = extract_ofd_amount_cents(custom_data, text)
+    text, pages, custom_data, body_values, visual_rows = read_ofd_text(path)
+    amount_cents = extract_ofd_amount_cents(custom_data, text, visual_rows)
     if amount_cents is None:
         raise ValueError("未识别到 OFD 发票金额")
     invoice_date = ""
@@ -802,7 +995,7 @@ def parse_invoice(path: Path) -> Invoice:
         raise ValueError(f"不支持的发票格式：{path.suffix}")
 
     text, pages = read_pdf_text(path)
-    amount_cents = extract_amount_cents(text)
+    amount_cents = read_pdf_amount_cents(path, text)
     if amount_cents is None and fitz is not None:
         fitz_text, fitz_pages = read_pdf_text_with_fitz(path)
         fitz_amount_cents = extract_amount_cents(fitz_text)
@@ -1768,6 +1961,10 @@ def export_combination_excel(
         header_format = workbook.add_format({**body, "bold": True, "font_color": "#FFFFFF", "bg_color": "#374151", "align": "center"})
         file_format = workbook.add_format({**body, "text_wrap": True})
         summary_format = workbook.add_format({**body, "num_format": "#,##0.00", "bold": True, "align": "right"})
+        difference_format = workbook.add_format({
+            **body, "bold": True, "align": "left", "indent": 1,
+            "num_format": '"超出："#,##0.00" 元";"不足："#,##0.00" 元";"金额刚好";@',
+        })
         link_format = workbook.add_format({**body, "font_color": "#1565C0", "underline": True})
         sheet.hide_gridlines(2)
         sheet.set_default_row(23)
@@ -1790,12 +1987,11 @@ def export_combination_excel(
             sheet.write_number("B4", target_cents / 100, number_format)
         sheet.write_string("C4", "组合金额（元）", spaced_label_format)
         sheet.write_formula("D4", f"=ROUND(SUM(D8:D{last_row}),2)", summary_format, total)
-        sheet.write_string("E4", "差额（元）", spaced_label_format)
         difference = (total_cents - target_cents) / 100 if target_cents is not None else ""
-        sheet.write_formula("F4", '=IF(ISNUMBER(B4),ROUND(D4-B4,2),"")', summary_format, difference)
+        sheet.merge_range("E4:F4", "", difference_format)
+        sheet.write_formula("E4", '=IF(ISNUMBER(B4),ROUND(D4-B4,2),"")', difference_format, difference)
         sheet.write_string("A5", "发票张数", label_format)
         sheet.write_formula("B5", f"=COUNT(A8:A{last_row})", label_format, len(invoice_list))
-        sheet.write_string("E5", "正数超出，负数不足", text_format)
         columns = ["序号", "类型", "发票号码", "金额（元）", "开票日期", "销售方", "文件名", "预览页码"]
         sheet.add_table(6, 0, last_row - 1, 7, {
             "name": "InvoiceDetails",
@@ -1857,8 +2053,8 @@ def archive_combination_documents(
             raise
 
     directory.mkdir(parents=True, exist_ok=True)
-    destination_pdf = unique_pdf_excel_destination(directory, preview_pdf.name)
-    destination_excel = destination_pdf.with_suffix(".xlsx")
+    destination_pdf = unique_destination(directory, preview_pdf.name)
+    destination_excel = unique_destination(directory, f"{directory.name}.xlsx")
     source_excel = preview_pdf.with_suffix(".xlsx")
     try:
         shutil.copy2(preview_pdf, destination_pdf)

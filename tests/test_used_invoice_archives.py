@@ -7,6 +7,7 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 import autoinvoice as m
 from test_combination_excel import read_sheet
@@ -75,6 +76,16 @@ class UsedInvoiceArchiveTests(unittest.TestCase):
             app.generate_combination_preview()
         self.assertIsNotNone(app.print_preview_pdf)
         return app.print_preview_pdf
+
+    def linked_pdf(self, workbook):
+        with zipfile.ZipFile(workbook) as archive:
+            relationships = ET.fromstring(archive.read("xl/worksheets/_rels/sheet1.xml.rels"))
+        links = [item for item in relationships if item.attrib.get("Type", "").endswith("/hyperlink")]
+        self.assertEqual(len(links), 1)
+        target = Path(links[0].attrib["Target"])
+        self.assertFalse(target.is_absolute())
+        self.assertEqual(links[0].attrib["TargetMode"], "External")
+        return workbook.parent / target
 
     def test_amount_and_content_inputs_fit_both_window_sizes(self):
         app = self.make_app()
@@ -222,10 +233,12 @@ class UsedInvoiceArchiveTests(unittest.TestCase):
         original_excel = preview.with_suffix(".xlsx").read_bytes()
         self.archive(app.mark_all_used)
         directory = m.USED_DIR / "报销20261102"
+        workbook = directory / "报销20261102.xlsx"
         self.assertTrue((directory / preview.name).is_file())
-        self.assertTrue((directory / preview.with_suffix(".xlsx").name).is_file())
+        self.assertTrue(workbook.is_file())
         self.assertEqual((directory / preview.name).read_bytes(), original_pdf)
-        self.assertEqual((directory / preview.with_suffix(".xlsx").name).read_bytes(), original_excel)
+        self.assertEqual(workbook.read_bytes(), original_excel)
+        self.assertEqual(self.linked_pdf(workbook), directory / preview.name)
         self.assertTrue((directory / "first.pdf").is_file())
         self.assertTrue((directory / "second.pdf").is_file())
         self.assertEqual(preview.read_bytes(), original_pdf)
@@ -246,7 +259,8 @@ class UsedInvoiceArchiveTests(unittest.TestCase):
         self.assertEqual(float(cells["D4"]["value"]), 100)
         self.assertEqual(cells["B5"]["value"], "1")
         self.assertEqual(cells["C8"]["value"], "12345678")
-        self.assertEqual(m.count_pdf_pages(workbooks[0].with_suffix(".pdf")), 1)
+        self.assertEqual(workbooks[0].name, "报销20261102.xlsx")
+        self.assertEqual(m.count_pdf_pages(self.linked_pdf(workbooks[0])), 1)
         self.assertEqual(m.count_pdf_pages(preview), 3)
         self.assertTrue(Path(second.path).is_file())
         self.assertEqual(app.result_invoices, [second])
@@ -259,7 +273,37 @@ class UsedInvoiceArchiveTests(unittest.TestCase):
         self.assertEqual(len(workbooks), 1)
         _, cells = read_sheet(workbooks[0])
         self.assertEqual(float(cells["D4"]["value"]), 100)
-        self.assertEqual(m.count_pdf_pages(workbooks[0].with_suffix(".pdf")), 1)
+        self.assertEqual(workbooks[0].name, "报销20261102.xlsx")
+        self.assertEqual(m.count_pdf_pages(self.linked_pdf(workbooks[0])), 1)
+
+    def test_archive_workbook_uses_custom_directory_name_and_link_survives_relocation(self):
+        invoice = self.pdf_invoice()
+        app = self.make_app([invoice])
+        preview = self.generate_preview(app)
+        directory = m.USED_DIR / "分公司 差旅20261102"
+        pdf, workbook = m.archive_combination_documents([invoice], directory, 10000, preview)
+        self.assertEqual(workbook.name, "分公司 差旅20261102.xlsx")
+        self.assertEqual(pdf.name, preview.name)
+        elsewhere = self.root / "different_computer"
+        elsewhere.mkdir()
+        relocated = directory.rename(elsewhere / directory.name)
+        linked_pdf = self.linked_pdf(relocated / workbook.name)
+        self.assertEqual(linked_pdf.read_bytes(), preview.read_bytes())
+        self.assertFalse(directory.exists())
+
+    def test_existing_archive_workbook_gets_suffix_without_renaming_pdf(self):
+        invoice = self.pdf_invoice()
+        app = self.make_app([invoice])
+        preview = self.generate_preview(app)
+        directory = m.USED_DIR / "报销20261102"
+        directory.mkdir()
+        existing = directory / "报销20261102.xlsx"
+        existing.write_bytes(b"preserve previous workbook")
+        pdf, workbook = m.archive_combination_documents([invoice], directory, 10000, preview)
+        self.assertEqual(workbook.name, "报销20261102_1.xlsx")
+        self.assertEqual(pdf.name, preview.name)
+        self.assertEqual(existing.read_bytes(), b"preserve previous workbook")
+        self.assertEqual(self.linked_pdf(workbook), pdf)
 
     def test_new_preview_does_not_reuse_filename_of_existing_excel_only(self):
         invoice = self.pdf_invoice()
@@ -271,21 +315,22 @@ class UsedInvoiceArchiveTests(unittest.TestCase):
         self.assertFalse(pdf.with_suffix(".xlsx").exists())
         self.assertEqual(existing.read_bytes(), b"preserve previous workbook")
 
-    def test_bundle_filename_collision_keeps_both_pairs_and_updates_pdf_link(self):
+    def test_bundle_filename_collision_keeps_all_files_and_updates_pdf_link(self):
         invoice = self.pdf_invoice()
         app = self.make_app([invoice])
         preview = self.generate_preview(app)
         directory = m.USED_DIR / "报销20261102"
         directory.mkdir()
         (directory / preview.name).write_bytes(b"existing PDF")
-        (directory / preview.with_suffix(".xlsx").name).write_bytes(b"existing Excel")
+        existing_excel = directory / "报销20261102.xlsx"
+        existing_excel.write_bytes(b"existing Excel")
         self.archive(app.mark_all_used)
         new_pdf = directory / f"{preview.stem}_1.pdf"
-        new_excel = new_pdf.with_suffix(".xlsx")
+        new_excel = directory / "报销20261102_1.xlsx"
         self.assertTrue(new_pdf.is_file())
         self.assertTrue(new_excel.is_file())
         self.assertEqual((directory / preview.name).read_bytes(), b"existing PDF")
-        self.assertEqual((directory / preview.with_suffix(".xlsx").name).read_bytes(), b"existing Excel")
+        self.assertEqual(existing_excel.read_bytes(), b"existing Excel")
         with zipfile.ZipFile(new_excel) as archive:
             self.assertIn(new_pdf.name.encode("utf-8"), archive.read("xl/worksheets/_rels/sheet1.xml.rels"))
         self.assertEqual(m.count_pdf_pages(new_pdf), 1)

@@ -51,7 +51,7 @@ class CombinationExcelTests(unittest.TestCase):
         self.assertEqual(cells["E8"]["type"], "n")
         self.assertEqual(cells["D4"]["formula"], "ROUND(SUM(D8:D9),2)")
         self.assertEqual(float(cells["D4"]["value"]), 345.2)
-        self.assertEqual(float(cells["F4"]["value"]), 5.2)
+        self.assertEqual(float(cells["E4"]["value"]), 5.2)
         self.assertEqual(cells["B5"]["formula"], "COUNT(A8:A9)")
         self.assertEqual(cells["B5"]["value"], "2")
         self.assertEqual(cells["H8"]["value"], "1")
@@ -67,7 +67,7 @@ class CombinationExcelTests(unittest.TestCase):
         path = m.export_combination_excel([invoice], self.root / "blank.xlsx", page_counts=[1])
         _, cells = read_sheet(path)
         self.assertNotIn("B4", cells)
-        self.assertEqual(cells["F4"]["value"], None)
+        self.assertEqual(cells["E4"]["value"], None)
         self.assertEqual(cells["E8"]["value"], "")
         self.assertEqual(cells["C8"]["value"], "")
 
@@ -75,10 +75,29 @@ class CombinationExcelTests(unittest.TestCase):
         invoice = m.replace(self.invoices[0], filename="=SUM(1,2).png", seller="=1+1")
         path = m.export_combination_excel([invoice], self.root / "literal.xlsx", 30000, [1])
         _, cells = read_sheet(path)
-        self.assertEqual(float(cells["F4"]["value"]), -4.8)
+        self.assertEqual(float(cells["E4"]["value"]), -4.8)
         for address in ("F8", "G8"):
             self.assertEqual(cells[address]["type"], "s")
             self.assertIsNone(cells[address]["formula"])
+
+    def test_difference_status_stays_numeric_and_formats_each_outcome_inline(self):
+        expected_format = '"超出："#,##0.00" 元";"不足："#,##0.00" 元";"金额刚好";@'
+        for target, difference in ((34000, 5.2), (35000, -4.8), (34520, 0.0), (None, None)):
+            with self.subTest(target=target):
+                path = m.export_combination_excel(self.invoices, self.root / f"status-{target}.xlsx", target, [1, 2])
+                sheet, cells = read_sheet(path)
+                self.assertEqual(cells["E4"]["formula"], 'IF(ISNUMBER(B4),ROUND(D4-B4,2),"")')
+                value = cells["E4"]["value"]
+                self.assertEqual(float(value) if value is not None else None, difference)
+                self.assertNotIn("正数超出，负数不足", [cell["value"] for cell in cells.values()])
+                self.assertIn("E4:F4", [item.attrib["ref"] for item in sheet.findall("s:mergeCells/s:mergeCell", NAMESPACE)])
+                with zipfile.ZipFile(path) as archive:
+                    styles = ET.fromstring(archive.read("xl/styles.xml"))
+                cell = sheet.find('.//s:c[@r="E4"]', NAMESPACE)
+                style = styles.find("s:cellXfs", NAMESPACE)[int(cell.attrib["s"])]
+                number_formats = {item.attrib["numFmtId"]: item.attrib["formatCode"] for item in styles.findall("s:numFmts/s:numFmt", NAMESPACE)}
+                self.assertEqual(number_formats[style.attrib["numFmtId"]], expected_format)
+                self.assertEqual(style.find("s:alignment", NAMESPACE).attrib["horizontal"], "left")
 
     def test_empty_combination_or_invalid_page_counts_is_rejected(self):
         for invoices, counts in (([], []), (self.invoices, [1]), (self.invoices, [1, 0])):
