@@ -22,6 +22,13 @@ Get-Process AutoInvoice -ErrorAction SilentlyContinue | Stop-Process -Force
 Copy-Item .\AutoInvoice.exe D:\nick\project\autoinvoice\AutoInvoice.exe -Force
 ```
 
+如果构建在 PyInstaller 打出第一行 stderr 时就中断（`build.ps1` 里 `$ErrorActionPreference = "Stop"`
+会把原生程序的 stderr 当成错误），改用 cmd 包装，让 stderr 直接落盘而不再转成 ErrorRecord：
+
+```powershell
+cmd /c "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File D:\nick\project\autoinvoice-ds\build.ps1 -SkipDependencyInstall > build.log 2>&1"
+```
+
 验证方式：标题栏显示 `AutoInvoice 发票报销助手 v1.<MMDD>.<HHmm>`。
 构建后可用 `AutoInvoice.exe --scan-json` 对 `invoices\` 做一次无界面冒烟测试。
 
