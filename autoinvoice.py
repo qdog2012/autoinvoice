@@ -66,7 +66,7 @@ LEGACY_RUNTIME_FILES = (
     (APP_DIR / "app_settings.json", SETTINGS_FILE),
     (APP_DIR / "invoice_records.sqlite3", DATABASE_FILE),
 )
-APP_VERSION = "v1.1103.1434"
+APP_VERSION = "v1.1103.1442"
 
 CATEGORY_ALL = "全部"
 CATEGORIES = [CATEGORY_ALL, "交通", "餐饮", "住宿", "办公", "其他"]
@@ -1427,6 +1427,143 @@ def load_used_invoice_numbers() -> set[str]:
     return {normalize_invoice_number_value(row["invoice_number"]) for row in rows}
 
 
+COMBINATION_PDF_PREFIX = "发票组合"
+
+
+def used_archive_directories() -> list[Path]:
+    """Subdirectories of used_invoices that may hold archived invoices."""
+    if not USED_DIR.exists():
+        return []
+    return sorted(
+        (path for path in USED_DIR.iterdir() if path.is_dir() and not path.name.startswith(".")),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+
+
+def archived_invoice_files(directory: Path) -> list[Path]:
+    """Invoice files inside one archive directory, without the merged PDF."""
+    if not directory.is_dir():
+        return []
+    return sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if path.is_file()
+            and path.suffix.lower() in SUPPORTED_INVOICE_SUFFIXES
+            and not path.name.startswith("~$")
+            and not path.name.startswith(COMBINATION_PDF_PREFIX)
+        ),
+        key=invoice_file_sort_key,
+    )
+
+
+def delete_used_invoice_records(invoice_numbers: Iterable[str]) -> int:
+    numbers = {normalize_invoice_number_value(number) for number in invoice_numbers}
+    numbers = {number for number in numbers if number}
+    if not numbers:
+        return 0
+    ensure_database()
+    placeholders = ", ".join("?" for _ in numbers)
+    with closing(db_connect()) as connection, connection:
+        cursor = connection.execute(
+            f"DELETE FROM used_invoices WHERE invoice_number IN ({placeholders})",
+            tuple(sorted(numbers)),
+        )
+        return cursor.rowcount
+
+
+def remove_json_records(file_path: Path, invoice_numbers: Iterable[str]) -> int:
+    """Drop records from the legacy JSON so a restart cannot replay them into SQLite."""
+    numbers = {normalize_invoice_number_value(number) for number in invoice_numbers}
+    numbers = {number for number in numbers if number}
+    if not numbers or not file_path.exists():
+        return 0
+    try:
+        records = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    if not isinstance(records, list):
+        return 0
+    kept = [
+        record
+        for record in records
+        if not (
+            isinstance(record, dict)
+            and normalize_invoice_number_value(record.get("invoice_number")) in numbers
+        )
+    ]
+    removed = len(records) - len(kept)
+    if removed:
+        file_path.write_text(json.dumps(kept, ensure_ascii=False, indent=2), encoding="utf-8")
+    return removed
+
+
+def used_invoice_numbers_in_archive(directory: Path) -> dict[str, str]:
+    """Map archived file name (lowercase) to its recorded invoice number."""
+    ensure_database()
+    target = directory.resolve()
+    with closing(db_connect()) as connection, connection:
+        rows = connection.execute(
+            "SELECT filename, invoice_number, moved_to FROM used_invoices"
+        ).fetchall()
+    mapping: dict[str, str] = {}
+    for row in rows:
+        filename = str(row["filename"] or "").strip()
+        moved_to = str(row["moved_to"] or "").strip()
+        if not filename or not moved_to:
+            continue
+        try:
+            parent = Path(moved_to).resolve().parent
+        except OSError:
+            continue
+        if parent != target:
+            continue
+        mapping[filename.casefold()] = normalize_invoice_number_value(row["invoice_number"])
+    return mapping
+
+
+def invoice_number_for_restore(path: Path) -> str:
+    stem = normalize_invoice_number_value(path.stem)
+    if re.fullmatch(r"[0-9]{8,30}", stem):
+        return stem
+    try:
+        return normalize_invoice_number_value(parse_invoice(path).invoice_number)
+    except Exception:
+        return ""
+
+
+def restore_used_archive(directory: Path) -> tuple[list[Path], set[str], list[str]]:
+    """Move one archived batch back to invoices/ and clear its used records."""
+    if not directory.is_dir():
+        raise ValueError(f"目录不存在：{directory}")
+    files = archived_invoice_files(directory)
+    if not files:
+        raise ValueError("该子目录没有可还原的发票文件")
+    recorded_numbers = used_invoice_numbers_in_archive(directory)
+    ensure_dirs()
+    moved: list[Path] = []
+    numbers: set[str] = set()
+    errors: list[str] = []
+    for source in files:
+        invoice_number = recorded_numbers.get(source.name.casefold(), "") or invoice_number_for_restore(source)
+        try:
+            destination = move_invoice(source, INVOICE_DIR)
+        except Exception as exc:
+            errors.append(f"{source.name}: {exc}")
+            continue
+        moved.append(destination)
+        if invoice_number:
+            numbers.add(invoice_number)
+    if numbers:
+        try:
+            delete_used_invoice_records(numbers)
+            remove_json_records(STATE_FILE, numbers)
+        except Exception as exc:
+            errors.append(f"已移动 {len(moved)} 张发票，但清除已使用记录失败：{exc}")
+    return moved, numbers, errors
+
+
 def invoice_type_override_key(invoice: Invoice) -> str:
     invoice_number = normalize_invoice_number_value(invoice.invoice_number)
     if invoice_number:
@@ -2535,6 +2672,7 @@ class AutoInvoiceApp(tk.Tk):
         ttk.Button(actions, text="扫描发票", command=self.scan).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(actions, text="发票目录", command=lambda: os.startfile(INVOICE_DIR)).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(actions, text="自动文件名", command=self.rename_files_by_invoice_number).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(actions, text="还原已使用", command=self.restore_used_invoices).pack(side=tk.LEFT, padx=(0, 8))
 
         category_controls = ttk.Frame(controls)
         category_controls.pack(fill=tk.X, pady=(8, 0))
@@ -2720,6 +2858,88 @@ class AutoInvoiceApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("自动文件名失败", f"{exc}\n\n{traceback.format_exc()}")
             self.set_status("自动文件名失败")
+
+    def choose_used_archive(self, directories: list[Path]) -> Path | None:
+        dialog = tk.Toplevel(self)
+        dialog.title("选择要还原的已使用目录")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.geometry("480x380")
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text=f"选择 {USED_DIR} 下的一个子目录：").pack(anchor=tk.W)
+        tree = ttk.Treeview(frame, columns=("name", "count"), show="headings", selectmode="browse")
+        tree.heading("name", text="子目录")
+        tree.heading("count", text="发票数")
+        tree.column("name", width=320, anchor=tk.W)
+        tree.column("count", width=80, anchor=tk.E)
+        tree.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+        for directory in directories:
+            tree.insert("", tk.END, iid=directory.name, values=(directory.name, len(archived_invoice_files(directory))))
+        if directories:
+            first = directories[0].name
+            tree.selection_set(first)
+            tree.focus(first)
+        chosen: dict[str, Path | None] = {"value": None}
+
+        def confirm(_event=None) -> None:
+            selection = tree.selection()
+            if not selection:
+                return
+            chosen["value"] = USED_DIR / selection[0]
+            dialog.destroy()
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill=tk.X)
+        ttk.Button(buttons, text="取消", command=cancel).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="还原", command=confirm).pack(side=tk.RIGHT, padx=(0, 8))
+        tree.bind("<Double-1>", confirm)
+        dialog.bind("<Escape>", lambda _event: cancel())
+        dialog.grab_set()
+        dialog.wait_window()
+        return chosen["value"]
+
+    def restore_used_invoices(self) -> None:
+        if self.scanning_running or self.calculation_running:
+            return
+        directories = used_archive_directories()
+        if not directories:
+            messagebox.showinfo("没有已使用记录", f"{USED_DIR} 下还没有已归档的子目录。")
+            return
+        chosen = self.choose_used_archive(directories)
+        if chosen is None:
+            return
+        files = archived_invoice_files(chosen)
+        if not files:
+            messagebox.showinfo("没有可还原的发票", f"{chosen.name} 中没有发票文件。")
+            return
+        if not messagebox.askyesno(
+            "确认还原",
+            f"将把“{chosen.name}”中的 {len(files)} 张发票移回 invoices 目录，"
+            f"并清除它们的“已使用”记录。\n\n"
+            f"该目录中的合并 PDF 与 Excel 核对表保持不动。\n是否继续？",
+            icon="warning",
+            default=messagebox.NO,
+            parent=self,
+        ):
+            return
+        try:
+            moved, numbers, errors = restore_used_archive(chosen)
+        except Exception as exc:
+            messagebox.showerror("还原失败", f"{exc}\n\n{traceback.format_exc()}")
+            self.set_status("还原失败")
+            return
+        if moved:
+            self.scan()
+        detail = f"已把 {len(moved)} 张发票还原到 invoices，并清除 {len(numbers)} 条已使用记录。"
+        if errors:
+            messagebox.showwarning("部分还原未完成", f"{detail}\n\n" + "\n".join(errors))
+        else:
+            messagebox.showinfo("已还原", detail)
+        self.set_status(f"已从 {chosen.name} 还原 {len(moved)} 张发票")
 
     def update_available_summary(self) -> None:
         total = sum(invoice.amount_cents for invoice in self.invoices)
