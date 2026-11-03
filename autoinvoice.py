@@ -66,7 +66,7 @@ LEGACY_RUNTIME_FILES = (
     (APP_DIR / "app_settings.json", SETTINGS_FILE),
     (APP_DIR / "invoice_records.sqlite3", DATABASE_FILE),
 )
-APP_VERSION = "v1.1103.1403"
+APP_VERSION = "v1.1103.1434"
 
 CATEGORY_ALL = "全部"
 CATEGORIES = [CATEGORY_ALL, "交通", "餐饮", "住宿", "办公", "其他"]
@@ -226,6 +226,21 @@ def parse_money_to_cents(value: str) -> int | None:
 
 
 def read_pdf_text(path: Path) -> tuple[str, int]:
+    """Read PDF text, preferring PyMuPDF.
+
+    Some e-invoice generators (ETC toll receipts among them) embed digits in a
+    way pypdf turns into space-separated single characters and mojibake, which
+    silently drops the invoice number and date. PyMuPDF decodes those files
+    correctly, so it is tried first and pypdf stays as the fallback.
+    """
+    if fitz is not None:
+        try:
+            text, pages = read_pdf_text_with_fitz(path)
+        except Exception:
+            text, pages = "", 0
+        if text.strip():
+            return text, pages
+
     text_parts: list[str] = []
     pages = 0
     try:
@@ -235,15 +250,7 @@ def read_pdf_text(path: Path) -> tuple[str, int]:
             text_parts.append(page.extract_text() or "")
     except Exception:
         text_parts = []
-
-    text = "\n".join(text_parts).strip()
-    if len(text) >= 20 or fitz is None:
-        return normalize_text(text), pages
-
-    with fitz.open(path) as doc:
-        pages = len(doc)
-        text = "\n".join(page.get_text("text") for page in doc)
-    return normalize_text(text), pages
+    return normalize_text("\n".join(text_parts).strip()), pages
 
 
 def read_pdf_text_with_fitz(path: Path) -> tuple[str, int]:
@@ -254,8 +261,10 @@ def read_pdf_text_with_fitz(path: Path) -> tuple[str, int]:
         return normalize_text(text), len(doc)
 
 
-def cluster_visual_rows(items: Iterable[tuple[float, float, float, float, str]]) -> list[str]:
-    """Rebuild visual text rows from positioned text runs.
+def cluster_visual_row_parts(
+    items: Iterable[tuple[float, float, float, float, str]],
+) -> list[list[tuple[float, str]]]:
+    """Rebuild visual text rows from positioned text runs, keeping x positions.
 
     Many e-invoices draw each cell as its own text object, so the reading order
     produced by the PDF text extractor is not the visual order. Grouping runs by
@@ -279,16 +288,18 @@ def cluster_visual_rows(items: Iterable[tuple[float, float, float, float, str]])
         else:
             rows.append([y0, y1, [(x0, text)]])
     rows.sort(key=lambda row: row[0])
-    return [
-        " ".join(text for _, text in sorted(row[2], key=lambda part: part[0]))
-        for row in rows
-    ]
+    return [sorted(row[2], key=lambda part: part[0]) for row in rows]
 
 
-def read_pdf_visual_rows(path: Path) -> list[str]:
+def cluster_visual_rows(items: Iterable[tuple[float, float, float, float, str]]) -> list[str]:
+    return [" ".join(text for _, text in parts) for parts in cluster_visual_row_parts(items)]
+
+
+def read_pdf_visual_row_parts(path: Path) -> list[tuple[float, list[tuple[float, str]]]]:
+    """Return (page_width, row parts) for every visual row of the PDF."""
     if fitz is None:
         return []
-    lines: list[str] = []
+    rows: list[tuple[float, list[tuple[float, str]]]] = []
     try:
         with fitz.open(path) as doc:
             for page in doc:
@@ -302,10 +313,16 @@ def read_pdf_visual_rows(path: Path) -> list[str]:
                             continue
                         x0, y0, x1, y1 = line.get("bbox")
                         items.append((x0, y0, x1, y1, text))
-                lines.extend(cluster_visual_rows(items))
+                width = float(page.rect.width)
+                for parts in cluster_visual_row_parts(items):
+                    rows.append((width, parts))
     except Exception:
         return []
-    return lines
+    return rows
+
+
+def read_pdf_visual_rows(path: Path) -> list[str]:
+    return [" ".join(text for _, text in parts) for _, parts in read_pdf_visual_row_parts(path)]
 
 
 def get_ocr_engine():
@@ -942,6 +959,58 @@ def extract_seller(text: str) -> str:
                     value = match.group(1).strip()
                     if value and "名称" not in value:
                         return value[:80]
+    # Buyer and seller are often joined into one line (`名称: 买方 名称: 卖方`),
+    # e.g. in OCR output; the trailing 名称: block is the seller.
+    for line in compact_lines:
+        labels = list(re.finditer(r"名\s*称\s*[:：]", line))
+        if len(labels) < 2:
+            continue
+        value = line[labels[-1].end() :]
+        value = re.split(r"名\s*称\s*[:：]|统一社会信用代码|纳税人识别号", value)[0]
+        value = value.strip(" 　:：")
+        if value and "名称" not in value:
+            return value[:80]
+    return ""
+
+
+SELLER_NAME_LABEL_RE = re.compile(r"名\s*称\s*[:：]")
+SELLER_STOP_RE = re.compile(r"统一社会信用代码|纳税人识别号|识别号")
+
+
+def extract_seller_from_row_parts(
+    rows: Iterable[tuple[float, list[tuple[float, str]]]],
+) -> str:
+    """Read the seller name from the right-hand 名称: block of the invoice header.
+
+    The header draws buyer and seller side by side, each as `名称:` followed by
+    the name, so the rightmost `名称:` on the page belongs to the seller.
+    """
+    for page_width, parts in rows:
+        ordered = sorted(parts, key=lambda part: part[0])
+        labels = [(x, text) for x, text in ordered if SELLER_NAME_LABEL_RE.search(text)]
+        if len(labels) < 2:
+            continue
+        seller_labels = [(x, text) for x, text in labels if x >= page_width * 0.5]
+        if not seller_labels:
+            continue
+        label_x, label_text = seller_labels[-1]
+        pieces = SELLER_NAME_LABEL_RE.split(label_text, 1)
+        name = pieces[1].strip() if len(pieces) > 1 else ""
+        if not name:
+            # The name is the first real entry to the right of the label; label
+            # and tax-id captions can share that x, so skip them instead of
+            # stopping at the first one.
+            for x, text in ordered:
+                if x <= label_x:
+                    continue
+                candidate = text.strip(" 　:：")
+                if not candidate or "名称" in candidate or SELLER_STOP_RE.search(candidate):
+                    continue
+                name = candidate
+                break
+        name = name.strip(" 　:：")
+        if name and "名称" not in name and not SELLER_STOP_RE.search(name):
+            return name[:80]
     return ""
 
 
@@ -995,16 +1064,15 @@ def parse_invoice(path: Path) -> Invoice:
         raise ValueError(f"不支持的发票格式：{path.suffix}")
 
     text, pages = read_pdf_text(path)
-    amount_cents = read_pdf_amount_cents(path, text)
-    if amount_cents is None and fitz is not None:
-        fitz_text, fitz_pages = read_pdf_text_with_fitz(path)
-        fitz_amount_cents = extract_amount_cents(fitz_text)
-        if fitz_amount_cents is not None:
-            text = fitz_text
-            pages = fitz_pages
-            amount_cents = fitz_amount_cents
+    row_parts = read_pdf_visual_row_parts(path)
+    amount_cents = amount_cents_from_visual_rows(
+        " ".join(part for _, part in parts) for _, parts in row_parts
+    )
+    if amount_cents is None:
+        amount_cents = extract_amount_cents(text)
     if amount_cents is None:
         raise ValueError("未识别到发票金额")
+    seller = extract_seller_from_row_parts(row_parts) or extract_seller(text)
     return Invoice(
         path=str(path),
         filename=path.name,
@@ -1012,7 +1080,7 @@ def parse_invoice(path: Path) -> Invoice:
         invoice_type=classify_invoice(text),
         invoice_date=extract_invoice_date(text),
         invoice_number=extract_invoice_number(text),
-        seller=extract_seller(text),
+        seller=seller,
         pages=pages,
     )
 
