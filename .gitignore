@@ -3,6 +3,7 @@
 /used_invoices/
 /failed_invoices/
 /void_invoices/
+/hold_invoices/
 /data/
 /print_jobs/
 
