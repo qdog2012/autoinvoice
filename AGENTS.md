@@ -51,4 +51,9 @@ cmd /c "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File D:\nick\proj
 - 产物（`AutoInvoice.exe`、`dist\`、`build\`、`*.spec`）在 `.gitignore` 里，不提交。
 - 运行数据（`data\`、`invoices\`、`used_invoices\`、`print_jobs\` 等）不进版本库。
 - 全量测试：`python -m unittest discover -s tests`。
-- `D:\nick\project\autoinvoice\` 里的源码不参与构建，保持现状即可；若需在那边重建，先从本目录同步 `autoinvoice.py`。
+
+## `D:\nick\project\autoinvoice\` 是运行目录，不是代码副本
+
+- 那边**只运行 exe**。它的 `autoinvoice.py`、`tests\`、`README.md` 以及它的 git 状态都**不归本仓库管**。
+- 不要读取或修改那边的源码，不要在那里提交，也不要把它当作构建或对账的输入。
+- 那边代码如需更新，由用户手动处理；本仓库的职责仅限于把 `AutoInvoice.exe` 复制过去。
